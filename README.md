@@ -54,7 +54,35 @@ It builds a release binary and installs `~/.local/bin/punkterm` plus a
 launcher entry. It only touches those two files (and system packages, after
 asking); an existing file it did not create is left alone.
 
-macOS support is in progress on the `macos` branch.
+### macOS
+
+macOS 11+ on Apple Silicon or Intel, with the Xcode command line tools
+(`xcode-select --install`) and, ideally, [Homebrew](https://brew.sh) for tmux:
+
+```sh
+git clone -b macos https://github.com/Launchable-AI/punkterm
+cd punkterm
+scripts/install-macos.sh      # asks before installing anything
+```
+
+It builds punkterm and installs `~/Applications/punkterm.app` (open it from
+Spotlight, Launchpad or the Dock) and a `~/.local/bin/punkterm` link.
+
+On a Mac:
+
+- **⌘ stands in for Ctrl+Shift** in punkterm's own keys: ⌘C / ⌘V copy and
+  paste, ⌘T a new shell, ⌘D the dashboard, ⌘= / ⌘- text size, ⌘? help.
+  Ctrl still goes to your programs as usual. ⌘H and ⌘Q are macOS's own (hide,
+  quit), so the timeline stays on Ctrl+Shift+H.
+- **Left Option is Alt** (Meta in shells, Alt+hjkl between panes); right
+  Option still types accented characters.
+- **Ctrl+Space**, punkterm's split leader, is also macOS's default "select
+  the previous input source" shortcut. If you use more than one input source,
+  turn that off in System Settings → Keyboard → Keyboard Shortcuts → Input
+  Sources.
+- There is no primary selection: selecting text doesn't copy it; use ⌘C.
+- Prefs are kept in `~/Library/Application Support/punkterm/`; the hosts
+  config is still `~/.config/punkterm/config.toml`.
 
 ## Use
 

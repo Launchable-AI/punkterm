@@ -1,4 +1,4 @@
-//! Clipboard via wl-clipboard (Wayland) or xclip, whichever is installed.
+//! Clipboard via wl-clipboard (Wayland), xclip (X11) or pbcopy/pbpaste (macOS).
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -13,6 +13,13 @@ pub fn copy_primary(text: &str) {
 }
 
 fn write(text: &str, primary: bool) {
+    // macOS has one pasteboard and no primary selection.
+    if cfg!(target_os = "macos") {
+        if !primary {
+            pipe("pbcopy", &[], text);
+        }
+        return;
+    }
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     let (cmd, args): (&str, &[&str]) = match (wayland, primary) {
         (true, false) => ("wl-copy", &[]),
@@ -20,6 +27,10 @@ fn write(text: &str, primary: bool) {
         (false, false) => ("xclip", &["-selection", "clipboard"]),
         (false, true) => ("xclip", &["-selection", "primary"]),
     };
+    pipe(cmd, args, text);
+}
+
+fn pipe(cmd: &str, args: &[&str], text: &str) {
     if let Ok(mut child) = Command::new(cmd).args(args).stdin(Stdio::piped()).spawn() {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(text.as_bytes());
@@ -39,6 +50,14 @@ pub fn paste_primary() -> Option<String> {
 }
 
 fn read(primary: bool) -> Option<String> {
+    if cfg!(target_os = "macos") {
+        // No primary selection: paste_primary falls back to the pasteboard.
+        if primary {
+            return None;
+        }
+        let out = Command::new("pbpaste").stderr(Stdio::null()).output().ok()?;
+        return out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned());
+    }
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     let sel = if primary { "primary" } else { "clipboard" };
     let out = if wayland {

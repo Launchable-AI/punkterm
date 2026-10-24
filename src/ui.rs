@@ -1083,7 +1083,7 @@ impl App {
 
     pub fn cycle_sound(&mut self) {
         if !self.sound.available() {
-            self.toast("SOUND // NO PLAYER (pw-play / paplay)");
+            self.toast("SOUND // NO PLAYER (pw-play / paplay / afplay)");
             return;
         }
         let m = self.sound.mode.next();

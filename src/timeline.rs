@@ -18,12 +18,13 @@ def load(p):
     except Exception: return None
 root = subprocess.run(['tmux', 'display', '-p', '-t', sys.argv[1], '#{pane_pid}'], capture_output=True, text=True, timeout=5).stdout.strip()
 if not root.isdigit(): raise SystemExit
-kids = {}
-for pid in os.listdir('/proc'):
-    if not pid.isdigit(): continue
-    try:
-        with open('/proc/%s/stat' % pid) as f: kids.setdefault(f.read().rsplit(')', 1)[1].split()[1], []).append(pid)
-    except Exception: pass
+# The process tree from ps (there is no /proc on macOS): children, argv.
+kids, args = {}, {}
+for l in subprocess.run(['ps', '-A', '-o', 'pid=', '-o', 'ppid=', '-o', 'command='], capture_output=True, text=True, timeout=5).stdout.splitlines():
+    f = l.split(None, 2)
+    if len(f) == 3:
+        kids.setdefault(f[1], []).append(f[0])
+        args[f[0]] = f[2].split()
 sid, name, todo = None, None, [root]
 for _ in range(5):
     nxt = []
@@ -31,9 +32,7 @@ for _ in range(5):
         s = load(os.path.join(cdir, 'sessions', pid + '.json'))
         if s and s.get('sessionId'):
             sid, name = s['sessionId'], s.get('name'); break
-        try:
-            with open('/proc/%s/cmdline' % pid, 'rb') as f: argv = f.read().decode(errors='replace').split('\0')
-        except Exception: argv = []
+        argv = args.get(pid, [])
         if len(argv) >= 3 and 'claude' in os.path.basename(argv[0]) and argv[1] == 'attach':
             j = load(os.path.join(cdir, 'jobs', os.path.basename(argv[2]), 'state.json')) or {}
             if j.get('sessionId'): sid, name = j['sessionId'], j.get('name'); break

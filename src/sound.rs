@@ -156,7 +156,7 @@ pub struct Sound {
 
 impl Sound {
     pub fn new(mode: Mode) -> Self {
-        let player = ["pw-play", "paplay"].into_iter().find(|p| {
+        let player = ["pw-play", "paplay", "afplay"].into_iter().find(|p| {
             Command::new(p).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
         });
         let mut s = Sound { mode, dir: None, player, last: HashMap::new() };

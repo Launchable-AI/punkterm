@@ -35,7 +35,7 @@ pub fn config_path() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("PUNKTERM_CONFIG") {
         return Some(p.into());
     }
-    dirs::config_dir().map(|d| d.join("punkterm").join("config.toml"))
+    crate::state::config_dir().map(|d| d.join("punkterm").join("config.toml"))
 }
 
 /// The local machine first, then every configured host, then `extra` specs

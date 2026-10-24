@@ -208,7 +208,7 @@ impl Theme {
     }
 
     pub fn themer_dir() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("themer").join("themes"))
+        crate::state::config_dir().map(|d| d.join("themer").join("themes"))
     }
 
     /// Every theme punkterm can cycle through: its own, then themer's dark ones.

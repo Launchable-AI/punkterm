@@ -63,7 +63,7 @@ impl Glyphs {
         // Not every machine has the Nerd Font: fall back to a monospace
         // family that is installed, so the grid never lands on a sans face.
         let has = |name: &str| fs.db().faces().any(|f| f.families.iter().any(|(n, _)| n == name));
-        let mono = [mono, "JetBrainsMono Nerd Font Mono", "JetBrains Mono", "Ubuntu Mono", "DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono"]
+        let mono = [mono, "JetBrainsMono Nerd Font Mono", "JetBrains Mono", "Ubuntu Mono", "DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono", "SF Mono", "Menlo"]
             .into_iter()
             .find(|n| has(n))
             .map(str::to_string)

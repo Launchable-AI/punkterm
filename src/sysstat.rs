@@ -1,4 +1,5 @@
-//! Live readouts for the HUD: CPU and memory from /proc, and local time.
+//! Live readouts for the HUD: CPU and memory (from /proc on Linux, the
+//! sysinfo crate on macOS), and local time.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -8,11 +9,21 @@ pub struct SysStat {
     pub cpu: f32,
     pub mem: f32,
     utc_offset: i64,
+    #[cfg(target_os = "macos")]
+    sys: sysinfo::System,
 }
 
 impl SysStat {
     pub fn new() -> Self {
-        let mut s = SysStat { last: Instant::now(), prev: None, cpu: 0.0, mem: 0.0, utc_offset: utc_offset() };
+        let mut s = SysStat {
+            last: Instant::now(),
+            prev: None,
+            cpu: 0.0,
+            mem: 0.0,
+            utc_offset: utc_offset(),
+            #[cfg(target_os = "macos")]
+            sys: sysinfo::System::new(),
+        };
         s.sample();
         s
     }
@@ -25,6 +36,16 @@ impl SysStat {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn sample(&mut self) {
+        self.sys.refresh_cpu_usage();
+        self.sys.refresh_memory();
+        self.cpu = self.sys.global_cpu_usage() / 100.0;
+        self.mem = self.sys.used_memory() as f32 / (self.sys.total_memory() as f32).max(1.0);
+        let _ = self.prev;
+    }
+
+    #[cfg(not(target_os = "macos"))]
     fn sample(&mut self) {
         if let Ok(stat) = std::fs::read_to_string("/proc/stat") {
             if let Some(line) = stat.lines().next() {

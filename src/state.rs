@@ -14,8 +14,19 @@ pub struct Prefs {
     pub timeline: Option<bool>,
 }
 
+/// Where hand-written config lives: ~/.config on Linux, and on macOS too
+/// (as for most terminal tools), not ~/Library/Application Support.
+pub fn config_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        dirs::home_dir().map(|h| h.join(".config"))
+    } else {
+        dirs::config_dir()
+    }
+}
+
 fn path() -> Option<PathBuf> {
-    dirs::state_dir().map(|d| d.join("punkterm").join("state.toml"))
+    // macOS has no state dir; Application Support is its closest.
+    dirs::state_dir().or_else(dirs::data_local_dir).map(|d| d.join("punkterm").join("state.toml"))
 }
 
 pub fn load() -> Prefs {

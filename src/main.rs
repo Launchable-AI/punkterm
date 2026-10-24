@@ -27,7 +27,10 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, StartCause, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
+#[cfg(target_os = "linux")]
 use winit::platform::wayland::WindowAttributesExtWayland;
+#[cfg(target_os = "macos")]
+use winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::term::Spawn;
@@ -111,6 +114,39 @@ fn spawn_spec(cmd: Option<&str>, keep_alive: bool) -> Spawn {
     }
 }
 
+/// An app opened from Finder or the Dock gets launchd's bare environment:
+/// no Homebrew on PATH (so no tmux) and possibly no SHELL.
+fn mac_env() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    let mut dirs: Vec<&str> = ["/opt/homebrew/bin", "/usr/local/bin"]
+        .into_iter()
+        .filter(|d| std::path::Path::new(d).is_dir() && !path.split(':').any(|p| p == *d))
+        .collect();
+    // Safety: runs first thing in main, before any thread exists.
+    unsafe {
+        if !dirs.is_empty() {
+            dirs.push(&path);
+            std::env::set_var("PATH", dirs.join(":"));
+        }
+        if std::env::var_os("SHELL").is_none() {
+            std::env::set_var("SHELL", "/bin/zsh");
+        }
+    }
+}
+
+/// On macOS, Cmd does what Ctrl+Shift does elsewhere (Cmd+C copies, Cmd+T
+/// opens a shell, Cmd+= grows the text); Ctrl keeps going to programs.
+fn mac_command(m: ModifiersState) -> ModifiersState {
+    if cfg!(target_os = "macos") && m.super_key() {
+        (m - ModifiersState::SUPER) | ModifiersState::CONTROL | ModifiersState::SHIFT
+    } else {
+        m
+    }
+}
+
 /// With Ctrl held over a link: underline it and show a hand.
 fn hover_link(app: &mut App, gpu: &Gpu, mouse: (f64, f64), mods: ModifiersState) {
     if app.hover_link(mouse.0 as f32, mouse.1 as f32, mods.control_key()) {
@@ -132,6 +168,7 @@ fn paste_into(app: &mut App, text: Option<String>) {
 }
 
 fn main() {
+    mac_env();
     let args = parse_args();
     let prefs = state::load();
     let theme = Theme::load(args.theme.as_deref().or(prefs.theme.as_deref()));
@@ -173,9 +210,15 @@ impl ApplicationHandler for Win {
         }
         let attrs = Window::default_attributes()
             .with_title("punkterm")
-            .with_name("punkterm", "punkterm")
             .with_inner_size(LogicalSize::new(1440.0, 900.0))
             .with_transparent(true);
+        // The app id compositors group and match windows by.
+        #[cfg(target_os = "linux")]
+        let attrs = attrs.with_name("punkterm", "punkterm");
+        // Left Option is Alt (Alt+hjkl, Meta in shells); right Option still
+        // types accented characters.
+        #[cfg(target_os = "macos")]
+        let attrs = attrs.with_option_as_alt(OptionAsAlt::OnlyLeft);
         let window = Arc::new(el.create_window(attrs).expect("window"));
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(window.clone())));
         let surface = instance.create_surface(window.clone()).expect("surface");
@@ -285,7 +328,7 @@ impl ApplicationHandler for Win {
                 hover_link(app, gpu, self.mouse, self.mods);
             }
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if event.state == ElementState::Pressed => {
-                let m = self.mods;
+                let m = mac_command(self.mods);
                 let code = match event.physical_key {
                     PhysicalKey::Code(c) => Some(c),
                     _ => None,

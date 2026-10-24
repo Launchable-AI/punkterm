@@ -26,12 +26,14 @@ try:
     import subprocess
     out = subprocess.run(['tmux', 'list-panes', '-a', '-F', '#{pane_pid} #{pane_id}'], capture_output=True, text=True, timeout=5).stdout
     panes = dict(l.split() for l in out.splitlines() if len(l.split()) == 2)
-    def ppid(pid):
-        with open('/proc/%s/stat' % pid) as f: return f.read().rsplit(')', 1)[1].split()[1]
-    for pid in os.listdir('/proc') if panes else []:
-        if not pid.isdigit(): continue
+    # pid -> (parent, argv), from ps: there is no /proc on macOS.
+    ps = {}
+    for l in subprocess.run(['ps', '-A', '-o', 'pid=', '-o', 'ppid=', '-o', 'command='], capture_output=True, text=True, timeout=5).stdout.splitlines() if panes else []:
+        f = l.split(None, 2)
+        if len(f) == 3: ps[f[0]] = (f[1], f[2].split())
+    ppid = lambda pid: ps[pid][0]
+    for pid, (_, argv) in ps.items():
         try:
-            with open('/proc/%s/cmdline' % pid, 'rb') as f: argv = f.read().decode(errors='replace').split('\0')
             if len(argv) < 3 or 'claude' not in os.path.basename(argv[0]) or argv[1] != 'attach': continue
             job = os.path.basename(argv[2])
             name = (load(os.path.join(home, '.claude', 'jobs', job, 'state.json')) or {}).get('name')

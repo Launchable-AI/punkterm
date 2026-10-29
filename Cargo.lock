@@ -1584,6 +1584,7 @@ dependencies = [
  "bytemuck",
  "cosmic-text",
  "dirs",
+ "flate2",
  "png",
  "pollster",
  "serde",

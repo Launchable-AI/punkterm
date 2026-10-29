@@ -18,6 +18,8 @@ pub enum Want {
     Ignore,
     Panes,
     Capture(String),
+    /// A pane's cursor, asked right after its capture.
+    Cursor(String),
 }
 
 #[derive(Debug)]
@@ -121,12 +123,15 @@ impl Writer {
 
     pub fn capture(&self, pane: &str) {
         self.command(Want::Capture(pane.to_string()), &format!("capture-pane -p -e -t {pane} -S -{}", crate::term::SCROLLBACK));
+        // The cursor as of the capture: the one from the last pane listing
+        // can be older (a new shell's, before it printed its prompt).
+        self.command(Want::Cursor(pane.to_string()), &format!("display -p -t {pane} \"#{{cursor_x}} #{{cursor_y}}\""));
     }
 }
 
 /// Fields of a pane listing, separated by a glyph that never occurs in titles.
 pub const SEP: char = '\u{241F}';
-const PANE_FORMAT: &str = "#{pane_id}\u{241F}#{window_id}\u{241F}#{window_index}\u{241F}#{window_name}\u{241F}#{pane_width}\u{241F}#{pane_height}\u{241F}#{pane_current_command}\u{241F}#{pane_title}\u{241F}#{@cc_rail_pane}\u{241F}#{alternate_on}\u{241F}#{cursor_x}\u{241F}#{cursor_y}\u{241F}#{session_name}\u{241F}#{window_width}\u{241F}#{window_height}\u{241F}#{pane_left}\u{241F}#{pane_top}\u{241F}#{window_zoomed_flag}";
+const PANE_FORMAT: &str = "#{pane_id}\u{241F}#{window_id}\u{241F}#{window_index}\u{241F}#{window_name}\u{241F}#{pane_width}\u{241F}#{pane_height}\u{241F}#{pane_current_command}\u{241F}#{pane_title}\u{241F}#{@cc_rail_pane}\u{241F}#{alternate_on}\u{241F}#{cursor_x}\u{241F}#{cursor_y}\u{241F}#{session_name}\u{241F}#{window_width}\u{241F}#{window_height}\u{241F}#{pane_left}\u{241F}#{pane_top}\u{241F}#{window_zoomed_flag}\u{241F}#{mouse_standard_flag}#{mouse_button_flag}#{mouse_all_flag}#{mouse_sgr_flag}#{mouse_utf8_flag}#{keypad_cursor_flag}";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaneInfo {
@@ -146,6 +151,9 @@ pub struct PaneInfo {
     /// Where the pane sits in its window, in cells.
     pub pos: (usize, usize),
     pub zoomed: bool,
+    /// Modes the pane's program set, as tmux holds them: a capture brings
+    /// the screen but not these (`mode_sequences`).
+    pub modes: [bool; 6],
 }
 
 pub fn parse_pane(line: &str) -> Option<PaneInfo> {
@@ -170,7 +178,32 @@ pub fn parse_pane(line: &str) -> Option<PaneInfo> {
         window_size: (num(13), num(14)),
         pos: (num(15), num(16)),
         zoomed: f.get(17) == Some(&"1"),
+        modes: {
+            let m = f.get(18).unwrap_or(&"").as_bytes();
+            std::array::from_fn(|k| m.get(k) == Some(&b'1'))
+        },
     })
+}
+
+impl PaneInfo {
+    /// The sequences that set the modes `modes` records: mouse tracking
+    /// (click, drag, any motion), its SGR / UTF-8 encoding, cursor keys.
+    pub fn mode_sequences(&self) -> String {
+        let [standard, button, all, sgr, utf8, cursor_keys] = self.modes;
+        let mut s = String::new();
+        let mut on = |code: u16, set: bool| {
+            if set {
+                s.push_str(&format!("\x1b[?{code}h"));
+            }
+        };
+        on(1003, all);
+        on(1002, button && !all);
+        on(1000, standard && !button && !all);
+        on(1006, sgr);
+        on(1005, utf8);
+        on(1, cursor_keys);
+        s
+    }
 }
 
 /// `%output` data: octal escapes (`\ooo`) for control bytes and backslash.
@@ -305,8 +338,10 @@ pub fn list_sessions(ssh: Option<&str>) -> Result<Vec<String>, String> {
 }
 
 /// Create a detached session (used only when a host has none to join).
+/// Its first shell has Claude Code's image switch from the start: the
+/// server-wide one punkterm sets on connecting comes too late for it.
 pub fn new_detached_session(ssh: Option<&str>, name: &str) -> bool {
-    tmux_command(ssh, &["new-session", "-d", "-s", name]).stdin(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    tmux_command(ssh, &["new-session", "-d", "-s", name, "-e", "CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1"]).stdin(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
 pub struct Conn {

@@ -14,6 +14,7 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 
 mod chrome;
+mod menu;
 
 use crate::anim::Spring;
 use crate::claude::{self, Status};
@@ -49,6 +50,85 @@ struct Layout {
     timeline: Rect,
     /// Each heading's "+" button (new shell on that host), by host index.
     adds: Vec<Rect>,
+    /// Each heading's resume button (recent Claude sessions on that host).
+    resumes: Vec<Rect>,
+    /// The session list's visible band (top, bottom) above the footer, more
+    /// above or below it, how far it can scroll, and each card's unscrolled
+    /// top and height (to bring one into view).
+    pub rail_view: (f32, f32),
+    pub rail_more: (bool, bool),
+    pub rail_max: f32,
+    spans: Vec<(f32, f32)>,
+    /// Group headers: (group index, host index, rect).
+    heads: Vec<(usize, usize, Rect)>,
+}
+
+/// A named set of sessions in the rail, which can be rolled up: its
+/// sessions are then out of sight and skipped by every shortcut.
+#[derive(Clone, Debug)]
+pub struct Group {
+    pub name: String,
+    pub collapsed: bool,
+    /// Cards one line each, as when the rail is short of room; otherwise
+    /// full, with their activity lines.
+    pub brief: bool,
+    /// `member_key`s: host name and tmux pane.
+    pub members: Vec<String>,
+}
+
+/// The resume menu: one host's recent Claude sessions, newest first.
+pub struct ResumeMenu {
+    pub host: usize,
+    /// None while they are being read.
+    pub items: Option<Result<Vec<crate::resume::Recent>, String>>,
+    pub sel: usize,
+    /// The first row in view.
+    pub top: usize,
+}
+
+/// One line of the footer's PLAN panel.
+pub enum PlanLine {
+    /// PLAN ▾ … ALL ›
+    Head,
+    /// An account's name, its bars below (the bool: the active session's).
+    Account(crate::usage::Acct, bool),
+    Bar(crate::usage::Row),
+    /// An account on one line: name and its limits' percentages.
+    Compact(crate::usage::Acct, bool),
+    /// The configs not signed in yet, by name, on one line.
+    Unsigned(Vec<String>),
+}
+
+/// One account in the usage overview.
+pub struct AccountView {
+    pub name: String,
+    /// Hosts it is signed in on now.
+    pub live: Vec<usize>,
+    /// Its reading: when it was fetched (Unix ms), and the limits.
+    pub reading: Option<(u64, Vec<crate::usage::Row>)>,
+    /// Signed in, but Claude Code hasn't read its usage yet (just after a
+    /// /login); `reading` is then the last one kept, if any.
+    pub is_waiting: bool,
+    /// Not signed in anywhere now: when it last was, and where.
+    pub seen: Option<(u64, Vec<String>)>,
+}
+
+/// A session card held down: a drag once it moves a few pixels.
+pub struct CardDrag {
+    pub id: u64,
+    pub from: (f32, f32),
+    pub at: (f32, f32),
+    pub moving: bool,
+}
+
+/// A split's divider being dragged: the pane before it (left or above)
+/// takes the pointer's distance from its own edge as its new size.
+pub struct DividerDrag {
+    pub id: u64,
+    /// Between side-by-side panes (sets a width), else stacked (a height).
+    pub vertical: bool,
+    origin: f32,
+    size: usize,
 }
 
 /// Per-session UI state that outlives a single frame.
@@ -106,6 +186,8 @@ pub struct Prompt {
     /// Highlighted suggestion; `None` uses the typed text.
     pub sel: Option<usize>,
     history: Vec<String>,
+    /// Naming this group instead of connecting to a host.
+    pub group: Option<usize>,
 }
 
 impl Prompt {
@@ -166,10 +248,27 @@ pub struct App {
     /// Report punkterm's size to tmux. Off for headless snapshots, which
     /// must never resize anyone's windows.
     pub report_size: bool,
+    /// Save preference changes (off for snapshots).
+    pub persist: bool,
     /// Plan usage per host, refreshed in the background.
     usage: std::collections::HashMap<usize, crate::usage::Usage>,
     usage_tx: Sender<(usize, Option<crate::usage::Usage>)>,
     usage_rx: Receiver<(usize, Option<crate::usage::Usage>)>,
+    /// Remote hosts' CPU and memory use, for the active session's host.
+    host_sys: std::collections::HashMap<usize, (crate::sysstat::Load, Instant)>,
+    host_sys_tx: Sender<(usize, Option<crate::sysstat::Load>)>,
+    host_sys_rx: Receiver<(usize, Option<crate::sysstat::Load>)>,
+    host_sys_asked: Option<Instant>,
+    /// Pasted images copied to a host: (pane id, the path there, or why not).
+    paste_tx: Sender<(u64, Result<String, String>)>,
+    paste_rx: Receiver<(u64, Result<String, String>)>,
+    /// Image files read for panes (images sent by path): pane id, the
+    /// request, the bytes.
+    img_tx: Sender<(u64, crate::graphics::FileRequest, Option<Vec<u8>>)>,
+    img_rx: Receiver<(u64, crate::graphics::FileRequest, Option<Vec<u8>>)>,
+    /// Files fetched from ssh hosts by Ctrl+click: where each landed, or why not.
+    dl_tx: Sender<Result<std::path::PathBuf, String>>,
+    dl_rx: Receiver<Result<std::path::PathBuf, String>>,
     last_usage: Option<Instant>,
     /// The timeline rail is expanded (collapsed, it is a strip of ticks).
     pub timeline_open: bool,
@@ -206,7 +305,42 @@ pub struct App {
     /// When Ctrl+Space (the tmux-style leader) was pressed, while it waits
     /// for its key.
     pub leader: Option<Instant>,
+    /// The pane marked to join elsewhere (tmux's `select-pane -m`), by id.
+    marked: Option<u64>,
+    pub groups: Vec<Group>,
+    /// A card being dragged to another group.
+    pub card_drag: Option<CardDrag>,
+    /// Inline images' places on the GPU.
+    pub image_atlas: crate::graphics::Atlas,
+    /// A split divider being dragged, and whether the pointer is over one
+    /// (side by side: true).
+    pub divider: Option<DividerDrag>,
+    pub divider_hover: Option<bool>,
+    /// The right-click menu, while open.
+    pub menu: Option<menu::Menu>,
+    /// Sessions picked with Shift+click, by pane id, to group together.
+    pub picked: std::collections::HashSet<u64>,
+    /// A session number begun with the leader: more digits may follow.
+    pub digits: Option<(usize, Instant)>,
+    /// Joined panes' original sessions, by (host, tmux pane), for `break_out`.
+    joined: std::collections::HashMap<(usize, String), String>,
     help_t: f32,
+    /// The usage overview: every account's limits, across hosts.
+    pub usage_open: bool,
+    /// The resume menu, while open: a host's recent Claude sessions.
+    pub resume: Option<ResumeMenu>,
+    resume_tx: Sender<(usize, Result<Vec<crate::resume::Recent>, String>)>,
+    resume_rx: Receiver<(usize, Result<Vec<crate::resume::Recent>, String>)>,
+    /// The footer's PLAN and LOAD panels folded to a line each.
+    pub plan_collapsed: bool,
+    /// How far the rail's session list is scrolled (px).
+    pub rail_scroll: f32,
+    /// The session the list last scrolled to show.
+    rail_followed: Option<u64>,
+    pub load_collapsed: bool,
+    /// Every account seen on a host, with its last reading (accounts.toml).
+    known: Vec<crate::usage::Known>,
+    usage_t: f32,
     toast: Option<(String, Instant)>,
     pub overview: bool,
     overview_t: f32,
@@ -215,6 +349,12 @@ pub struct App {
     scroll_acc: f32,
     /// A mouse drag is extending the active pane's selection.
     selecting: bool,
+    /// The button held down while reporting the mouse to a program, and the
+    /// cell last reported (motion is reported once per cell).
+    mouse_held: Option<u8>,
+    mouse_cell: Option<(usize, usize)>,
+    /// Where the pointer is: wheel reports say so.
+    pub pointer: (f32, f32),
     /// Last left click (when, cell, count) for double/triple clicks.
     last_click: Option<(Instant, (i32, usize), u8)>,
     /// The link under the pointer while Ctrl is held, with its pane id.
@@ -232,6 +372,11 @@ impl App {
         let (disc_tx, disc_rx) = channel();
         let (cc_tx, cc_rx) = channel();
         let (usage_tx, usage_rx) = channel();
+        let (host_sys_tx, host_sys_rx) = channel();
+        let (paste_tx, paste_rx) = channel();
+        let (img_tx, img_rx) = channel();
+        let (dl_tx, dl_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
         let (tl_tx, tl_rx) = channel();
         let mut hostnames = std::collections::HashMap::new();
         if let Ok(h) = std::fs::read_to_string("/etc/hostname") {
@@ -269,9 +414,20 @@ impl App {
             prompt: None,
             prompt_t: 0.0,
             report_size: true,
+            persist: true,
             usage: Default::default(),
             usage_tx,
             usage_rx,
+            host_sys: Default::default(),
+            host_sys_tx,
+            host_sys_rx,
+            host_sys_asked: None,
+            paste_tx,
+            paste_rx,
+            img_tx,
+            img_rx,
+            dl_tx,
+            dl_rx,
             last_usage: None,
             timeline_open: false,
             timelines: Default::default(),
@@ -297,7 +453,27 @@ impl App {
             sound: Sound::new(sound::Mode::Off),
             help: false,
             leader: None,
+            marked: None,
+            groups: Vec::new(),
+            menu: None,
+            divider: None,
+            divider_hover: None,
+            image_atlas: Default::default(),
+            card_drag: None,
+            picked: Default::default(),
+            digits: None,
+            joined: Default::default(),
             help_t: 0.0,
+            usage_open: false,
+            resume: None,
+            resume_tx,
+            resume_rx,
+            plan_collapsed: false,
+            rail_scroll: 0.0,
+            rail_followed: None,
+            load_collapsed: false,
+            known: crate::usage::load_known(),
+            usage_t: 0.0,
             toast: None,
             overview: false,
             overview_t: 0.0,
@@ -305,6 +481,9 @@ impl App {
             overview_sel: 0,
             scroll_acc: 0.0,
             selecting: false,
+            mouse_held: None,
+            mouse_cell: None,
+            pointer: (0.0, 0.0),
             last_click: None,
             hover: None,
             overview_rects: Vec::new(),
@@ -336,36 +515,98 @@ impl App {
         // Host sections in host order; panes are kept grouped by host.
         // Cards collapse to one line when the full ones would not fit above
         // the footer.
-        let avail = rail.h - self.px(76.0) - self.px(130.0) - self.plan_h();
-        let need = |ch: f32, g: f32| self.hosts.len() as f32 * self.px(50.0) + self.panes.len() as f32 * (ch + g);
-        let (card_h, gap) = if need(self.px(56.0), self.px(6.0)) <= avail {
-            (self.px(56.0), self.px(6.0))
-        } else {
-            (self.px(32.0), self.px(4.0))
+        let avail = rail.h - self.px(76.0) - self.px(70.0) - self.plan_h() - self.load_h();
+        // Cards in a group are full unless it is set brief; ungrouped ones
+        // go brief (one line) when full ones would not fit.
+        let (full, brief) = ((self.px(56.0), self.px(6.0)), (self.px(32.0), self.px(4.0)));
+        let head_n: usize = (0..self.hosts.len()).map(|h| self.groups.iter().filter(|g| self.group_on(g, h)).count()).sum();
+        let need = |loose: (f32, f32)| {
+            let cards: f32 = (0..self.panes.len())
+                .filter(|&i| self.shown(i))
+                .map(|i| match self.group_of(i) {
+                    Some(g) if self.groups[g].brief => brief.0 + brief.1,
+                    Some(_) => full.0 + full.1,
+                    None => loose.0 + loose.1,
+                })
+                .sum();
+            self.hosts.len() as f32 * self.px(50.0) + head_n as f32 * self.px(28.0) + cards
         };
-        let mut y = rail.y + self.px(76.0);
+        let loose = if need(full) <= avail { full } else { brief };
+        // The list scrolls within the band above the footer.
+        let (view_top, view_bot) = (rail.y + self.px(76.0), self.footer_tops().0 - self.px(10.0));
+        // A heading's buttons stand 3px above its text: start low enough
+        // that the first one fits the band, or it is dropped as clipped.
+        let mut y = view_top + self.px(4.0) - self.rail_scroll;
+        let mut spans = vec![(0.0, 0.0); self.panes.len()];
         let mut cards = vec![Rect::default(); self.panes.len()];
         let mut sections = Vec::new();
         let mut adds = Vec::new();
+        let mut resumes = Vec::new();
+        let mut heads = Vec::new();
         let add = self.px(16.0);
         for h in 0..self.hosts.len() {
             sections.push((h, y));
             adds.push(Rect { x: rail.x + rail.w - self.px(18.0) - add, y: y - self.px(3.0), w: add, h: add });
+            resumes.push(Rect { x: rail.x + rail.w - self.px(18.0) - 2.0 * add - self.px(5.0), y: y - self.px(3.0), w: add, h: add });
             y += self.px(22.0);
             if h > 0 && !self.panes.iter().any(|p| p.host == h) {
                 y += self.px(16.0);
             }
+            // Ungrouped sessions, then each group under its header (panes
+            // are kept in this order by `regroup`).
+            let mut rank = None;
             for (i, p) in self.panes.iter().enumerate() {
-                if p.host == h {
-                    // Panes of one split window sit close, as one group.
-                    let mate = i + 1 < self.panes.len() && self.split_key(i).is_some() && self.split_key(i) == self.split_key(i + 1);
-                    cards[i] = Rect { x: rail.x + self.px(10.0), y, w: rail.w - self.px(20.0), h: card_h };
-                    y += card_h + if mate { self.px(2.0) } else { gap };
+                if p.host != h {
+                    continue;
                 }
+                let g = self.group_of(i);
+                if let Some(gi) = g.filter(|_| rank != Some(g)) {
+                    y += self.px(4.0);
+                    heads.push((gi, h, Rect { x: rail.x + self.px(10.0), y, w: rail.w - self.px(20.0), h: self.px(20.0) }));
+                    y += self.px(24.0);
+                }
+                rank = Some(g);
+                if !self.shown(i) {
+                    continue;
+                }
+                let (card_h, gap) = match g {
+                    Some(gi) if self.groups[gi].brief => brief,
+                    Some(_) => full,
+                    None => loose,
+                };
+                // Panes of one split window sit close, as one group.
+                let mate = i + 1 < self.panes.len() && self.split_key(i).is_some() && self.split_key(i) == self.split_key(i + 1);
+                cards[i] = Rect { x: rail.x + self.px(10.0), y, w: rail.w - self.px(20.0), h: card_h };
+                spans[i] = (y + self.rail_scroll, card_h);
+                y += card_h + if mate { self.px(2.0) } else { gap };
             }
             y += self.px(12.0);
         }
-        Layout { rail, panel, header, term, cards, sections, adds, timeline }
+        // Only what fits whole in the band is drawn (and clickable).
+        let total = y + self.rail_scroll - view_top;
+        let rail_max = (total - (view_bot - view_top)).max(0.0);
+        let fits = |top: f32, bottom: f32| top >= view_top - 0.5 && bottom <= view_bot + 0.5;
+        let mut more = (self.rail_scroll > 0.5, false);
+        for c in cards.iter_mut().filter(|c| c.w > 0.0) {
+            if !fits(c.y, c.y + c.h) {
+                more.1 |= c.y >= view_bot - 0.5;
+                *c = Rect::default();
+            }
+        }
+        heads.retain(|(_, _, r)| fits(r.y, r.y + r.h));
+        for (k, &(h, sy)) in sections.iter().enumerate() {
+            if !fits(sy - self.px(3.0), sy + self.px(14.0)) {
+                adds[h] = Rect::default();
+                resumes[h] = Rect::default();
+                if sy >= view_bot {
+                    more.1 = true;
+                }
+                let _ = k;
+            }
+        }
+        sections.retain(|&(_, sy)| fits(sy - self.px(3.0), sy + self.px(14.0)));
+        more.1 |= self.rail_scroll < rail_max - 0.5;
+        Layout { rail, panel, header, term, cards, sections, adds, resumes, rail_view: (view_top, view_bot), rail_more: more, rail_max, spans, heads, timeline }
     }
 
     pub fn grid_size(&self) -> Size {
@@ -425,15 +666,160 @@ impl App {
     }
 
     /// Plan usage for the host of the active session (at most three windows).
-    fn plan(&self) -> Option<(usize, crate::usage::Usage)> {
+    /// The account configs on the active session's host, the active
+    /// session's own first (marked), then the others in config order.
+    pub fn plan_accounts(&self) -> Vec<(crate::usage::Acct, bool)> {
         let h = self.active_host();
-        let u = self.usage.get(&h).filter(|u| !u.rows.is_empty())?;
-        Some((h, crate::usage::Usage { at_ms: u.at_ms, rows: u.rows.iter().take(3).cloned().collect(), rail_width: u.rail_width, account: u.account.clone(), names: Default::default() }))
+        let Some(u) = self.usage.get(&h) else { return Vec::new() };
+        let mut accts = u.accounts.clone();
+        if accts.is_empty() && (u.account.is_some() || !u.rows.is_empty()) {
+            accts.push(crate::usage::Acct { config: "default".into(), account: u.account.clone(), at_ms: u.at_ms, rows: u.rows.clone(), is_stale: u.is_stale });
+        }
+        // A session whose config isn't known (a plain shell, an older
+        // report) runs the default one.
+        let mine = self.panes.get(self.active).and_then(|p| p.tmux_pane.as_deref()).and_then(|tp| u.pane_account.get(tp).copied()).or(Some(0));
+        let mut out: Vec<(crate::usage::Acct, bool)> = accts.into_iter().enumerate().map(|(i, a)| (a, Some(i) == mine)).collect();
+        out.sort_by_key(|(_, active)| !*active);
+        out
     }
 
-    /// Height of the plan block in the rail footer.
-    fn plan_h(&self) -> f32 {
-        self.plan().map_or(0.0, |(_, u)| self.px(26.0) + u.rows.len() as f32 * self.px(20.0))
+    /// The footer's PLAN panel, line by line (what it draws and how tall).
+    pub fn plan_lines(&self) -> Vec<PlanLine> {
+        let accts = self.plan_accounts();
+        if accts.iter().all(|(a, _)| a.account.is_none() && a.rows.is_empty()) {
+            return Vec::new();
+        }
+        // The active session's account with its bars (unless folded), the
+        // other signed-in ones a line each, and those not signed in together.
+        let mut out = vec![PlanLine::Head];
+        let mut unsigned = Vec::new();
+        for (a, active) in accts {
+            if a.account.is_none() {
+                unsigned.push(a.short());
+            } else if self.plan_collapsed || !active || a.rows.is_empty() {
+                out.push(PlanLine::Compact(a, active));
+            } else {
+                let rows: Vec<crate::usage::Row> = a.rows.iter().take(3).cloned().collect();
+                out.push(PlanLine::Account(a, active));
+                out.extend(rows.into_iter().map(PlanLine::Bar));
+            }
+        }
+        if !unsigned.is_empty() {
+            out.push(PlanLine::Unsigned(unsigned));
+        }
+        out
+    }
+
+    pub fn plan_line_h(&self, l: &PlanLine) -> f32 {
+        self.px(match l {
+            PlanLine::Head => 24.0,
+            PlanLine::Account(..) => 20.0,
+            PlanLine::Bar(_) => 19.0,
+            PlanLine::Compact(..) | PlanLine::Unsigned(_) => 18.0,
+        })
+    }
+
+    /// The active session's remote host and its CPU and memory use, while
+    /// fresh: the footer shows it beside this machine's.
+    pub fn host_stats(&self) -> Option<(usize, crate::sysstat::Load)> {
+        let h = self.active_host();
+        self.host_sys.get(&h).filter(|(_, at)| h > 0 && at.elapsed().as_secs() < 20).map(|&(l, _)| (h, l))
+    }
+
+    /// Snapshots: give this machine account configs (default alice,
+    /// dev1 and a not-signed-in dev2), the active pane running dev1.
+    pub fn fake_accounts(&mut self) {
+        use crate::usage::{Acct, Row, Usage};
+        let now = crate::usage::now_ms();
+        let row = |l: &str, pct: f32, h: u64| Row { label: l.into(), pct, resets_ms: now + h * 3_600_000, severity: "normal".into() };
+        let mut u = Usage { account: Some("alice@example.com".into()), at_ms: now, ..Default::default() };
+        u.accounts = vec![
+            Acct { config: "default".into(), account: Some("alice@example.com".into()), at_ms: now, rows: vec![row("5h", 34.0, 2), row("wk", 61.0, 70)], is_stale: false },
+            Acct { config: "dev1".into(), account: Some("bob@example.com".into()), at_ms: now, rows: vec![row("5h", 93.0, 1), row("wk", 40.0, 90)], is_stale: false },
+            Acct { config: "dev2".into(), ..Default::default() },
+            Acct { config: "dev3".into(), ..Default::default() },
+            Acct { config: "dev4".into(), ..Default::default() },
+        ];
+        for p in &self.panes {
+            if let Some(tp) = &p.tmux_pane {
+                u.pane_account.insert(tp.clone(), if u.pane_account.is_empty() { 1 } else { 0 });
+            }
+        }
+        self.usage.insert(0, u);
+    }
+
+    /// Snapshots: pretend the active session is on a remote host with
+    /// these readings, to show the footer's two columns.
+    pub fn fake_host_stats(&mut self, name: &str, load: crate::sysstat::Load) {
+        self.hosts.push(crate::hosts::Host { name: name.into(), ssh: None, color: None });
+        let h = self.hosts.len() - 1;
+        if let Some(p) = self.panes.get_mut(self.active) {
+            p.host = h;
+        }
+        self.host_sys.insert(h, (load, Instant::now()));
+    }
+
+    /// The LOAD panel's blocks: this machine, and the session's remote host.
+    pub fn load_blocks(&self) -> Vec<(String, Rgba, crate::sysstat::Load)> {
+        let mut out = vec![("LOCAL".to_string(), self.theme.muted, self.sys.load())];
+        if let Some((h, load)) = self.host_stats() {
+            out.push((self.hosts[h].name.to_uppercase(), self.host_color(h), load));
+        }
+        out
+    }
+
+    /// Heights of the footer's panels: PLAN, then LOAD.
+    pub fn plan_h(&self) -> f32 {
+        let lines = self.plan_lines();
+        if lines.is_empty() { 0.0 } else { lines.iter().map(|l| self.plan_line_h(l)).sum::<f32>() + self.px(8.0) }
+    }
+
+    pub fn load_h(&self) -> f32 {
+        let blocks = self.load_blocks();
+        let per = |l: &crate::sysstat::Load| if l.disk.is_some() { 3.0 } else { 2.0 };
+        let body: f32 = if self.load_collapsed {
+            blocks.len() as f32 * self.px(18.0)
+        } else {
+            blocks.iter().map(|(_, _, l)| per(l) * self.px(19.0) + if blocks.len() > 1 { self.px(17.0) } else { 0.0 }).sum()
+        };
+        self.px(24.0) + body + self.px(8.0)
+    }
+
+    /// Where the footer's panels start: (PLAN top, LOAD top).
+    pub fn footer_tops(&self) -> (f32, f32) {
+        let r = self.layout_rail();
+        let load_y = r.y + r.h - self.px(48.0) - self.load_h();
+        (load_y - self.plan_h(), load_y)
+    }
+
+    fn layout_rail(&self) -> Rect {
+        let m = self.px(14.0);
+        Rect { x: m, y: m, w: self.px(292.0), h: self.size.1 as f32 - 2.0 * m }
+    }
+
+    /// A click on a footer panel's header: PLAN's collapses it (its ALL
+    /// opens the usage overview), LOAD's collapses that. False elsewhere.
+    pub fn footer_click(&mut self, x: f32, y: f32) -> bool {
+        let r = self.layout_rail();
+        if x < r.x || x > r.x + r.w {
+            return false;
+        }
+        let (py, ly) = self.footer_tops();
+        if !self.plan_lines().is_empty() && y >= py && y < py + self.px(24.0) {
+            if x > r.x + r.w - self.px(70.0) {
+                self.toggle_usage();
+            } else {
+                self.plan_collapsed = !self.plan_collapsed;
+                self.save_prefs();
+            }
+            return true;
+        }
+        if y >= ly && y < ly + self.px(24.0) {
+            self.load_collapsed = !self.load_collapsed;
+            self.save_prefs();
+            return true;
+        }
+        false
     }
 
     pub fn set_hosts(&mut self, hosts: Vec<Host>) {
@@ -504,7 +890,7 @@ impl App {
     }
 
     pub fn open_prompt(&mut self) {
-        self.prompt = Some(Prompt { text: String::new(), sel: None, history: crate::hosts::ssh_history() });
+        self.prompt = Some(Prompt { text: String::new(), sel: None, history: crate::hosts::ssh_history(), group: None });
         self.sound.play(Sfx::Blip);
     }
 
@@ -534,8 +920,14 @@ impl App {
                     Some(i) => p.matches().get(i).map(|s| s.to_string()).unwrap_or_default(),
                     None => p.text.trim().to_string(),
                 };
+                let group = p.group;
                 self.prompt = None;
-                if !spec.is_empty() {
+                if let Some(g) = group {
+                    if let Some(gr) = self.groups.get_mut(g).filter(|_| !spec.is_empty()) {
+                        gr.name = spec;
+                        self.save_prefs();
+                    }
+                } else if !spec.is_empty() {
                     self.add_host(&spec);
                 }
             }
@@ -556,6 +948,12 @@ impl App {
                 let g = self.grid_size();
                 if self.report_size {
                     c.writer.set_size(g.cols, g.lines);
+                }
+                // Claude Code keeps images off inside tmux unless told it may
+                // draw them: punkterm reads them from the raw pane output.
+                // Claude sessions started after this get the variable.
+                if self.persist {
+                    c.writer.command(tmuxcc::Want::Ignore, "set-environment -g CLAUDE_CODE_FORCE_TERMINAL_IMAGES 1");
                 }
                 self.conns.push(c);
             }
@@ -610,6 +1008,418 @@ impl App {
         }
     }
 
+    // ----------------------------------------------------------------- groups
+
+    /// How groups remember a session: its host's name and tmux pane, which
+    /// stay put across punkterm restarts (and joins).
+    fn member_key(&self, i: usize) -> String {
+        let p = &self.panes[i];
+        let host = self.hosts.get(p.host).map_or("", |h| h.name.as_str());
+        match &p.tmux_pane {
+            Some(tp) => format!("{host}\t{tp}"),
+            None => format!("{host}\tpty{}", p.id),
+        }
+    }
+
+    pub fn group_of(&self, i: usize) -> Option<usize> {
+        if i >= self.panes.len() {
+            return None;
+        }
+        let k = self.member_key(i);
+        self.groups.iter().position(|g| g.members.contains(&k))
+    }
+
+    /// Whether group `g` has sessions on host `h` (and so a header there).
+    fn group_on(&self, g: &Group, h: usize) -> bool {
+        (0..self.panes.len()).any(|i| self.panes[i].host == h && g.members.contains(&self.member_key(i)))
+    }
+
+    /// Out of a rolled-up group: listed in the rail and reachable by keys.
+    pub fn shown(&self, i: usize) -> bool {
+        self.group_of(i).is_none_or(|g| !self.groups[g].collapsed)
+    }
+
+    /// Session number `n` (from 1) as the rail numbers them: shown ones only.
+    pub fn select_nth(&mut self, n: usize) {
+        if let Some(i) = (0..self.panes.len()).filter(|&i| self.shown(i)).nth(n.wrapping_sub(1)) {
+            self.select(i);
+        }
+    }
+
+    /// The rail's number for session `i`.
+    pub fn ordinal(&self, i: usize) -> usize {
+        (0..i).filter(|&j| self.shown(j)).count() + 1
+    }
+
+    /// Shift+click: pick a session for grouping, or put it back.
+    pub fn pick(&mut self, i: usize) {
+        let Some(id) = self.panes.get(i).map(|p| p.id) else { return };
+        if !self.picked.remove(&id) {
+            self.picked.insert(id);
+        }
+    }
+
+    /// The picked sessions (else the active one), with any split-window
+    /// mates: a window's panes stay together.
+    fn picked_or_active(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = (0..self.panes.len()).filter(|&i| self.picked.contains(&self.panes[i].id)).collect();
+        if v.is_empty() && self.active < self.panes.len() {
+            v.push(self.active);
+        }
+        for i in v.clone() {
+            if let Some(k) = self.split_key(i) {
+                v.extend((0..self.panes.len()).filter(|&j| self.split_key(j) == Some(k)));
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    fn settle_groups(&mut self) {
+        self.groups.retain(|g| !g.members.is_empty());
+        self.picked.clear();
+        self.regroup();
+        self.save_prefs();
+    }
+
+    /// Put the picked sessions (else the active one) in a new group, then
+    /// ask for its name.
+    pub fn group_picked(&mut self) {
+        let keys: Vec<String> = self.picked_or_active().into_iter().map(|i| self.member_key(i)).collect();
+        if keys.is_empty() {
+            return;
+        }
+        for g in &mut self.groups {
+            g.members.retain(|m| !keys.contains(m));
+        }
+        let n = (1..).find(|n| !self.groups.iter().any(|g| g.name == format!("GROUP {n}"))).unwrap_or(1);
+        self.groups.push(Group { name: format!("GROUP {n}"), collapsed: false, brief: false, members: keys });
+        let g = self.groups.len() - 1;
+        self.settle_groups();
+        self.rename_group(Some(g));
+    }
+
+    /// Move session `i` (with its split-window mates) into group `g`.
+    pub fn move_to_group(&mut self, i: usize, g: usize) {
+        if g >= self.groups.len() {
+            return;
+        }
+        let mut idx = vec![i];
+        if let Some(k) = self.split_key(i) {
+            idx.extend((0..self.panes.len()).filter(|&j| j != i && self.split_key(j) == Some(k)));
+        }
+        let keys: Vec<String> = idx.into_iter().map(|j| self.member_key(j)).collect();
+        for gr in &mut self.groups {
+            gr.members.retain(|m| !keys.contains(m));
+        }
+        self.groups[g].members.extend(keys);
+        self.settle_groups();
+    }
+
+    /// Take the picked sessions (else the active one) out of their groups.
+    pub fn ungroup_picked(&mut self) {
+        let keys: Vec<String> = self.picked_or_active().into_iter().map(|i| self.member_key(i)).collect();
+        for g in &mut self.groups {
+            g.members.retain(|m| !keys.contains(m));
+        }
+        self.settle_groups();
+    }
+
+    /// Ask for a new name for group `g` (default: the active session's).
+    pub fn rename_group(&mut self, g: Option<usize>) {
+        let Some(g) = g.or_else(|| self.group_of(self.active)) else {
+            self.toast("GROUP // NOT IN ONE (⌃␣ G GROUPS)");
+            return;
+        };
+        self.prompt = Some(Prompt { text: String::new(), sel: None, history: Vec::new(), group: Some(g) });
+    }
+
+    /// Roll a group up, or out. Rolling up the active session's group moves
+    /// to the nearest session still in sight.
+    pub fn toggle_group(&mut self, g: usize) {
+        let Some(gr) = self.groups.get_mut(g) else { return };
+        gr.collapsed = !gr.collapsed;
+        self.sound.play(Sfx::Blip);
+        if !self.shown(self.active) {
+            let n = self.panes.len();
+            if let Some(i) = (1..n).map(|k| (self.active + k) % n).find(|&i| self.shown(i)) {
+                self.select(i);
+            }
+        }
+        self.save_prefs();
+    }
+
+    /// The FULL / BRIEF switch at the right end of a group's header.
+    pub fn brief_switch(&self, head: Rect) -> Rect {
+        let w = self.px(42.0);
+        Rect { x: head.x + head.w - w - self.px(4.0), y: head.y + self.px(3.0), w, h: head.h - self.px(6.0) }
+    }
+
+    /// A card pressed: it may be dragged to another group.
+    pub fn card_press(&mut self, i: usize, x: f32, y: f32) {
+        if let Some(p) = self.panes.get(i) {
+            self.card_drag = Some(CardDrag { id: p.id, from: (x, y), at: (x, y), moving: false });
+        }
+    }
+
+    /// The pointer moved with a card held. True while it is being dragged.
+    pub fn card_drag_to(&mut self, x: f32, y: f32) -> bool {
+        let Some(d) = self.card_drag.as_mut() else { return false };
+        d.at = (x, y);
+        d.moving |= (x - d.from.0).hypot(y - d.from.1) > 6.0;
+        d.moving
+    }
+
+    /// Where a dragged card would land at (x, y): `Some(Some(g))` into group
+    /// `g` (its header or one of its cards), `Some(None)` out of any group
+    /// (an ungrouped card), `None` nowhere.
+    pub fn drop_target(&self, x: f32, y: f32) -> Option<Option<usize>> {
+        if let Some(g) = self.head_at(x, y) {
+            return Some(Some(g));
+        }
+        self.card_at(x, y).map(|j| self.group_of(j))
+    }
+
+    /// The card was let go: move it into the group under the pointer.
+    pub fn card_drop(&mut self, x: f32, y: f32) -> bool {
+        let Some(d) = self.card_drag.take().filter(|d| d.moving) else { return false };
+        let Some(i) = self.panes.iter().position(|p| p.id == d.id) else { return true };
+        match self.drop_target(x, y) {
+            Some(Some(g)) if self.group_of(i) != Some(g) => self.move_to_group(i, g),
+            Some(None) if self.group_of(i).is_some() => {
+                self.picked.clear();
+                self.picked.insert(d.id);
+                self.ungroup_picked();
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Show a group's cards in full, or one line each.
+    pub fn toggle_brief(&mut self, g: usize) {
+        if let Some(gr) = self.groups.get_mut(g) {
+            gr.brief = !gr.brief;
+            self.save_prefs();
+        }
+    }
+
+    /// A click on a group header: its FULL / BRIEF switch, or roll it up.
+    pub fn head_click(&mut self, x: f32, y: f32) -> bool {
+        let Some(&(g, _, r)) = self.layout().heads.iter().find(|(_, _, r)| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) else { return false };
+        let b = self.brief_switch(r);
+        if !self.groups[g].collapsed && x >= b.x && x <= b.x + b.w {
+            self.toggle_brief(g);
+        } else {
+            self.toggle_group(g);
+        }
+        true
+    }
+
+    pub fn head_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.layout().heads.iter().find(|(_, _, r)| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h).map(|&(g, _, _)| g)
+    }
+
+    /// Read the files pane `i`'s program sent images by, where it runs: here,
+    /// or over ssh on its host.
+    fn read_image_files(&mut self, i: usize) {
+        if self.panes[i].graphics.files.is_empty() {
+            return;
+        }
+        let reqs = std::mem::take(&mut self.panes[i].graphics.files);
+        let (id, spec) = (self.panes[i].id, self.hosts.get(self.panes[i].host).and_then(|h| h.ssh.clone()));
+        for req in reqs {
+            let (tx, wake, spec) = (self.img_tx.clone(), self.wake.clone(), spec.clone());
+            std::thread::spawn(move || {
+                const MAX: u64 = 64 << 20;
+                let data = match spec {
+                    None => {
+                        let ok = std::fs::metadata(&req.path).is_ok_and(|m| m.is_file() && m.len() <= MAX);
+                        let d = ok.then(|| std::fs::read(&req.path).ok()).flatten();
+                        if req.delete {
+                            let _ = std::fs::remove_file(&req.path);
+                        }
+                        d
+                    }
+                    Some(spec) => {
+                        let q = format!("'{}'", req.path.replace('\'', "'\\''"));
+                        let rm = if req.delete { format!("; rm -f -- {q}") } else { String::new() };
+                        let cmd = format!("head -c {MAX} -- {q}{rm}");
+                        std::process::Command::new("ssh")
+                            .args(crate::tmuxcc::ssh_args(&spec))
+                            .arg(cmd)
+                            .stdin(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .output()
+                            .ok()
+                            .filter(|o| o.status.success() && !o.stdout.is_empty())
+                            .map(|o| o.stdout)
+                    }
+                };
+                let _ = tx.send((id, req, data));
+                wake();
+            });
+        }
+    }
+
+    /// The active session is Claude Code on a remote host.
+    pub fn remote_claude(&self) -> bool {
+        self.panes.get(self.active).is_some_and(|p| p.host > 0) && self.ui.get(self.active).is_some_and(|u| u.status != Status::Shell)
+    }
+
+    /// Paste `text` into pane `i`, bracketed when the program asked for it.
+    pub fn paste_text(&mut self, i: usize, text: &str) {
+        let Some(p) = self.panes.get(i) else { return };
+        let bracketed = p.term.lock().mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+        let body = text.replace("\r\n", "\r").replace('\n', "\r");
+        if bracketed {
+            p.write(format!("\x1b[200~{}\x1b[201~", body.replace('\x1b', "")).into_bytes());
+        } else {
+            p.write(body.into_bytes());
+        }
+    }
+
+    /// Paste the clipboard's image into the active session, as a file path
+    /// (Claude Code attaches a pasted image path). On a remote host the
+    /// image is copied there first over ssh: Claude's own Ctrl+V reads the
+    /// clipboard of the machine it runs on. False when there is no image.
+    pub fn paste_image(&mut self) -> bool {
+        let Some(p) = self.panes.get(self.active) else { return false };
+        let Some((bytes, ext)) = crate::clipboard::image() else { return false };
+        let (id, host) = (p.id, p.host);
+        let name = format!("paste-{}.{ext}", crate::usage::now_ms());
+        match self.hosts.get(host).and_then(|h| h.ssh.clone()) {
+            None => {
+                let dir = std::env::temp_dir().join("punkterm-paste");
+                let path = dir.join(&name);
+                if std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes)).is_err() {
+                    self.toast("IMAGE // COULD NOT SAVE");
+                    return true;
+                }
+                let i = self.active;
+                self.paste_text(i, &path.to_string_lossy());
+            }
+            Some(spec) => {
+                self.toast("IMAGE // SENDING…");
+                let (tx, wake) = (self.paste_tx.clone(), self.wake.clone());
+                std::thread::spawn(move || {
+                    let path = format!("/tmp/punkterm-paste/{name}");
+                    let cmd = format!("mkdir -p /tmp/punkterm-paste && cat > {path}");
+                    let ok = std::process::Command::new("ssh")
+                        .args(crate::tmuxcc::ssh_args(&spec))
+                        .arg(cmd)
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .and_then(|mut c| {
+                            use std::io::Write;
+                            c.stdin.take().map(|mut s| s.write_all(&bytes)).transpose()?;
+                            c.wait()
+                        })
+                        .is_ok_and(|s| s.success());
+                    let _ = tx.send((id, if ok { Ok(path) } else { Err("copy to host failed".into()) }));
+                    wake();
+                });
+            }
+        }
+        true
+    }
+
+    /// Mark the active pane to join elsewhere, or clear the mark.
+    pub fn mark(&mut self) {
+        let Some(p) = self.panes.get(self.active) else { return };
+        if self.marked == Some(p.id) {
+            self.marked = None;
+            self.toast("MARK // CLEARED");
+        } else {
+            self.marked = Some(p.id);
+            let name = if p.title.is_empty() { p.subtitle.clone() } else { clean_title(&p.title) };
+            self.toast(format!("MARKED // {}", name.to_uppercase()));
+        }
+    }
+
+    /// Join the marked pane beside the active one.
+    pub fn join_marked(&mut self) {
+        match self.marked.and_then(|id| self.panes.iter().position(|p| p.id == id)) {
+            Some(i) => self.join(i),
+            None => self.toast("JOIN // MARK A PANE FIRST (⌃␣ M)"),
+        }
+    }
+
+    /// Move pane `src` into the active pane's window, side by side, as
+    /// tmux's `join-pane -h` does. Both must be tmux panes on one host. A
+    /// session left with no windows closes; `break_out` brings it back.
+    pub fn join(&mut self, src: usize) {
+        let (Some(a), Some(s)) = (self.panes.get(self.active), self.panes.get(src)) else { return };
+        let (Some(conn), Some(dst_pane), Some(src_pane)) = (a.conn, a.tmux_pane.clone(), s.tmux_pane.clone()) else {
+            self.toast("JOIN // TMUX PANES ONLY");
+            return;
+        };
+        if s.host != a.host || s.conn.is_none() {
+            self.toast("JOIN // SAME HOST ONLY");
+            return;
+        }
+        if s.conn == a.conn && s.window == a.window {
+            self.toast("JOIN // ALREADY IN THIS WINDOW");
+            return;
+        }
+        let host = a.host;
+        if let Some(origin) = s.session.clone() {
+            self.joined.entry((host, src_pane.clone())).or_insert(origin);
+        }
+        self.marked = None;
+        if let Some(c) = self.conns.iter().find(|c| c.id == conn) {
+            self.sound.play(Sfx::Open);
+            c.writer.command(tmuxcc::Want::Ignore, &format!("join-pane -d -h -s {src_pane} -t {dst_pane}"));
+            c.writer.list_panes();
+        }
+    }
+
+    /// Move the active pane out to a window of its own (tmux's
+    /// `break-pane`): back in the session it was joined from, recreating
+    /// that session if joining closed it, else in its current one.
+    pub fn break_out(&mut self) {
+        let Some(p) = self.panes.get(self.active) else { return };
+        let (Some(conn), Some(pane), host) = (p.conn, p.tmux_pane.clone(), p.host) else { return };
+        if self.group(self.active).len() < 2 {
+            self.toast("BREAK // NOT A SPLIT");
+            return;
+        }
+        let here = p.session.clone();
+        let origin = self.joined.remove(&(host, pane.clone())).filter(|o| Some(o) != here.as_ref());
+        let Some(c) = self.conns.iter().find(|c| c.id == conn) else { return };
+        let w = c.writer.clone();
+        match origin {
+            Some(o) if self.conns.iter().any(|c| c.host == host && c.session == o) => {
+                w.command(tmuxcc::Want::Ignore, &format!("break-pane -d -s {pane} -t \"={o}:\""));
+            }
+            Some(o) => {
+                // tmux has no empty sessions: start one around a stand-in
+                // window, move the pane in, then drop the stand-in.
+                w.command(tmuxcc::Want::Ignore, &format!("new-session -d -s \"{o}\" -n punkterm-tmp"));
+                w.command(tmuxcc::Want::Ignore, &format!("break-pane -d -s {pane} -t \"={o}:\""));
+                w.command(tmuxcc::Want::Ignore, &format!("kill-window -t \"={o}:punkterm-tmp\""));
+                self.rediscover(host);
+            }
+            None => w.command(tmuxcc::Want::Ignore, &format!("break-pane -s {pane}")),
+        }
+        w.list_panes();
+    }
+
+    /// Look for new tmux sessions on `host` and attach to them.
+    fn rediscover(&self, host: usize) {
+        let Some(h) = self.hosts.get(host) else { return };
+        let (dest, tx, wake) = (h.ssh.clone(), self.disc_tx.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            // Let tmux act on the commands just sent first.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = tx.send((host, tmuxcc::list_sessions(dest.as_deref())));
+            wake();
+        });
+    }
+
     /// Zoom the active tmux pane to its whole window, or back (tmux's
     /// `resize-pane -Z`).
     pub fn toggle_zoom(&mut self) {
@@ -659,6 +1469,8 @@ impl App {
             mates.sort_by_key(|&j| (self.panes[j].pos.1, self.panes[j].pos.0));
             order.extend(mates);
         }
+        // Within each host: ungrouped sessions first, then group by group.
+        order.sort_by_key(|&i| (self.panes[i].host, self.group_of(i).map_or(0, |g| g + 1)));
         if order.iter().enumerate().all(|(k, &i)| k == i) {
             return;
         }
@@ -787,6 +1599,7 @@ impl App {
         let infos: Vec<tmuxcc::PaneInfo> = all.into_iter().filter(|p| !p.rail).collect();
         let hostname = self.hostnames.get(&host).cloned().unwrap_or_default();
         let mut focus = None;
+        let mut grouped = false;
         for info in &infos {
             if self.hidden.contains(&(conn, info.id.clone())) {
                 continue;
@@ -794,7 +1607,7 @@ impl App {
             let job = self.usage.get(&host).and_then(|u| u.names.get(&info.id));
             let title = if let Some(name) = job {
                 name.clone()
-            } else if info.title.is_empty() || info.title == hostname || is_hostname_like(&info.title) {
+            } else if info.title.is_empty() || info.title == hostname || is_hostname_like(&info.title) || is_graphics_title(&info.title) {
                 info.window_name.clone()
             } else {
                 info.title.clone()
@@ -802,10 +1615,15 @@ impl App {
             let sub = format!("{}:{} · {}", info.session, info.window_index, info.command);
             if let Some(p) = self.panes.iter_mut().find(|p| p.conn == Some(conn) && p.tmux_pane.as_deref() == Some(info.id.as_str())) {
                 p.set_tmux_size(info.cols, info.lines);
-                p.title = title;
+                // tmux takes an APC sequence as a title, so a kitty image
+                // command lands there: keep the title we had.
+                if !(job.is_none() && is_graphics_title(&info.title) && !p.title.is_empty()) {
+                    p.title = title;
+                }
                 p.subtitle = sub;
                 p.tmux_cursor = info.cursor;
                 p.tmux_alt = info.alt;
+                p.tmux_modes = pane_modes(info);
                 p.window = Some(info.window_id.clone());
                 p.pos = info.pos;
                 p.zoomed = info.zoomed;
@@ -821,6 +1639,7 @@ impl App {
             pane.session = Some(info.session.clone());
             pane.tmux_cursor = info.cursor;
             pane.tmux_alt = info.alt;
+            pane.tmux_modes = pane_modes(info);
             pane.window = Some(info.window_id.clone());
             pane.pos = info.pos;
             pane.zoomed = info.zoomed;
@@ -832,13 +1651,29 @@ impl App {
             if let Some(aid) = active_id {
                 self.active = self.panes.iter().position(|p| p.id == aid).unwrap_or(0);
             }
+            // A new pane goes in the group of its window's other panes (a
+            // split), else of the session it was opened from.
+            if self.group_of(at).is_none() {
+                let window = self.panes[at].window.clone();
+                let mate = (0..self.panes.len()).filter(|&j| j != at && self.panes[j].conn == Some(conn) && self.panes[j].window == window).find_map(|j| self.group_of(j));
+                let from = (self.focus_new == Some(conn)).then(|| self.group_of(self.active)).flatten().filter(|_| self.panes[self.active].host == host);
+                if let Some(g) = mate.or(from) {
+                    let key = self.member_key(at);
+                    self.groups[g].members.push(key);
+                    grouped = true;
+                }
+            }
             if self.focus_new == Some(conn) || self.panes.len() == 1 {
                 focus = Some(id);
             }
         }
+        if grouped {
+            self.save_prefs();
+        }
         // Panes that went away in tmux.
         let alive: Vec<&str> = infos.iter().map(|i| i.id.as_str()).collect();
-        let active_id = self.panes.get(self.active).map(|p| p.id);
+        let gone = |p: &Pane| p.conn == Some(conn) && !p.tmux_pane.as_deref().is_some_and(|id| alive.contains(&id));
+        let active_id = self.successor(|j| gone(&self.panes[j]));
         let mut k = 0;
         while k < self.panes.len() {
             let p = &self.panes[k];
@@ -865,9 +1700,13 @@ impl App {
         let rows = p.size.lines;
         let mut out = Vec::new();
         let lines: &[String] = if p.tmux_alt {
-            out.extend_from_slice(b"\x1b[?1049h\x1b[H");
+            out.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J");
             &lines[lines.len().saturating_sub(rows)..]
         } else {
+            // Replace what is there (a resync after a resize): clear the
+            // screen, then the history it scrolls into. Not a full reset,
+            // which would drop the modes the program has set.
+            out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J\x1b[3J");
             lines
         };
         for (i, l) in lines.iter().enumerate() {
@@ -878,8 +1717,20 @@ impl App {
         }
         let (cx, cy) = p.tmux_cursor;
         out.extend_from_slice(format!("\x1b[0m\x1b[{};{}H", cy + 1, cx + 1).as_bytes());
+        // The modes the program set before we attached (mouse, keys, paste).
+        out.extend_from_slice(p.tmux_modes.as_bytes());
         p.feed(&out);
         p.awaiting_capture = false;
+    }
+
+    /// Put a pane's cursor where tmux has it, right after its capture.
+    fn apply_cursor(&mut self, conn: u64, pane: &str, lines: &[String]) {
+        let Some(p) = self.panes.iter_mut().find(|p| p.conn == Some(conn) && p.tmux_pane.as_deref() == Some(pane)) else { return };
+        let mut it = lines.first().into_iter().flat_map(|l| l.split_whitespace()).filter_map(|v| v.parse::<usize>().ok());
+        if let (Some(x), Some(y)) = (it.next(), it.next()) {
+            p.tmux_cursor = (x, y);
+            p.feed(format!("\x1b[{};{}H", y + 1, x + 1).as_bytes());
+        }
     }
 
     // ------------------------------------------------------------ preferences
@@ -893,6 +1744,9 @@ impl App {
         }
         self.saved_hosts = p.hosts.clone();
         self.timeline_open = p.timeline.unwrap_or(false);
+        self.plan_collapsed = p.plan_collapsed.unwrap_or(false);
+        self.load_collapsed = p.load_collapsed.unwrap_or(false);
+        self.groups = p.groups.iter().map(|g| Group { name: g.name.clone(), collapsed: g.collapsed, brief: g.brief, members: g.members.clone() }).collect();
         if !theme_flag {
             if let Some(name) = &p.theme {
                 let t = Theme::load(Some(name));
@@ -903,12 +1757,18 @@ impl App {
     }
 
     fn save_prefs(&self) {
+        if !self.persist {
+            return;
+        }
         state::save(&Prefs {
             theme: Some(self.theme_target.name.clone()),
             opacity: Some(self.opacity),
             sound: Some(self.sound.mode.name().to_string()),
             hosts: self.saved_hosts.clone(),
             timeline: Some(self.timeline_open),
+            plan_collapsed: Some(self.plan_collapsed),
+            load_collapsed: Some(self.load_collapsed),
+            groups: self.groups.iter().map(|g| state::GroupPref { name: g.name.clone(), collapsed: g.collapsed, brief: g.brief, members: g.members.clone() }).collect(),
         });
     }
 
@@ -1093,6 +1953,68 @@ impl App {
         self.save_prefs();
     }
 
+    /// Open or close the usage overview; opening reads every host's usage
+    /// again.
+    pub fn toggle_usage(&mut self) {
+        self.usage_open = !self.usage_open;
+        self.sound.play(Sfx::Blip);
+        if self.usage_open {
+            for (i, h) in self.hosts.iter().enumerate() {
+                if i == 0 || self.host_state.get(i) == Some(&HostState::Up) {
+                    self.fetch_usage(i, h.ssh.clone());
+                }
+            }
+        }
+    }
+
+    /// Every account for the usage overview: those signed in on a host now
+    /// (with those hosts) and the others punkterm has seen, by email domain
+    /// and then by name.
+    pub fn usage_accounts(&self) -> Vec<AccountView> {
+        let mut out: Vec<AccountView> = Vec::new();
+        for h in 0..self.hosts.len() {
+            let Some(u) = self.usage.get(&h) else { continue };
+            for a in u.configs() {
+                let Some(name) = a.account.clone() else { continue };
+                let reading = (!a.is_stale && !a.rows.is_empty()).then(|| (a.at_ms, a.rows.clone()));
+                match out.iter_mut().find(|v| v.name == name) {
+                    Some(v) => {
+                        if !v.live.contains(&h) {
+                            v.live.push(h);
+                        }
+                        if reading.as_ref().is_some_and(|(at, _)| v.reading.as_ref().is_none_or(|(b, _)| at > b)) {
+                            v.reading = reading;
+                        }
+                        v.is_waiting &= a.is_stale;
+                    }
+                    None => out.push(AccountView { name, live: vec![h], reading, is_waiting: a.is_stale, seen: None }),
+                }
+            }
+        }
+        // Waiting on Claude Code: show the last reading kept, marked as such.
+        for v in out.iter_mut().filter(|v| v.reading.is_none()) {
+            if let Some(k) = self.known.iter().find(|k| k.account == v.name && !k.rows.is_empty()) {
+                v.reading = Some((k.at_ms, k.rows.clone()));
+            }
+        }
+        let mut away: Vec<&crate::usage::Known> = self.known.iter().filter(|k| !out.iter().any(|v| v.name == k.account)).collect();
+        away.sort_by_key(|k| std::cmp::Reverse(k.seen_ms));
+        for k in away {
+            let reading = (!k.rows.is_empty()).then(|| (k.at_ms, k.rows.clone()));
+            out.push(AccountView { name: k.account.clone(), live: Vec::new(), reading, is_waiting: false, seen: Some((k.seen_ms, k.hosts.clone())) });
+        }
+        // Grouped by the email's domain (one organisation's accounts
+        // together), then by the name before the @, alphabetically.
+        out.sort_by_cached_key(|v| {
+            let name = v.name.to_lowercase();
+            match name.rsplit_once('@') {
+                Some((user, domain)) => (domain.to_string(), user.to_string()),
+                None => (String::from("~"), name),
+            }
+        });
+        out
+    }
+
     pub fn toggle_help(&mut self) {
         self.help = !self.help;
         self.sound.play(Sfx::Blip);
@@ -1162,9 +2084,37 @@ impl App {
 
     pub fn cycle(&mut self, d: isize) {
         let n = self.panes.len() as isize;
-        if n > 0 {
-            self.select(((self.active as isize + d).rem_euclid(n)) as usize);
+        let mut i = self.active as isize;
+        for _ in 0..n {
+            i = (i + d).rem_euclid(n);
+            if self.shown(i as usize) {
+                self.select(i as usize);
+                return;
+            }
         }
+    }
+
+    /// Which pane to be on once the panes `gone` says are removed: the
+    /// active one if it stays; else the nearest pane of its split window;
+    /// else the nearest session in the rail, on its host first. Sessions in
+    /// rolled-up groups only as a last resort.
+    fn successor(&self, gone: impl Fn(usize) -> bool) -> Option<u64> {
+        let a = self.active;
+        let cur = self.panes.get(a)?;
+        if !gone(a) {
+            return Some(cur.id);
+        }
+        let left: Vec<usize> = (0..self.panes.len()).filter(|&j| !gone(j)).collect();
+        let mate = left
+            .iter()
+            .copied()
+            .filter(|&j| cur.conn.is_some() && self.panes[j].conn == cur.conn && self.panes[j].window == cur.window)
+            .min_by_key(|&j| self.panes[j].pos.0.abs_diff(cur.pos.0) + self.panes[j].pos.1.abs_diff(cur.pos.1));
+        let near = |ok: &dyn Fn(usize) -> bool| left.iter().copied().filter(|&j| ok(j)).min_by_key(|&j| (j.abs_diff(a), j < a));
+        mate.or_else(|| near(&|j| self.shown(j) && self.panes[j].host == cur.host))
+            .or_else(|| near(&|j| self.shown(j)))
+            .or_else(|| near(&|_| true))
+            .map(|j| self.panes[j].id)
     }
 
     /// Close the active session's view. A tmux pane is only hidden here —
@@ -1173,9 +2123,11 @@ impl App {
         let Some(p) = self.panes.get(self.active) else { return };
         if let (Some(conn), Some(tp)) = (p.conn, p.tmux_pane.clone()) {
             self.hidden.insert((conn, tp));
-            self.panes.remove(self.active);
-            self.ui.remove(self.active);
-            self.active = self.active.min(self.panes.len().saturating_sub(1));
+            let gone = self.active;
+            let next = self.successor(|j| j == gone);
+            self.panes.remove(gone);
+            self.ui.remove(gone);
+            self.active = next.and_then(|id| self.panes.iter().position(|p| p.id == id)).unwrap_or(0);
             self.transition = None;
             if self.panes.is_empty() {
                 self.quit = true;
@@ -1208,13 +2160,112 @@ impl App {
     }
 
     /// The host whose "+" button is under (x, y).
+    pub fn resume_at(&self, x: f32, y: f32) -> Option<usize> {
+        let pad = self.px(3.0);
+        self.layout().resumes.iter().position(|r| x >= r.x - pad && x <= r.x + r.w + pad && y >= r.y - pad && y <= r.y + r.h + pad)
+    }
+
+    /// Open the resume menu for `host`, reading its recent sessions.
+    pub fn open_resume(&mut self, host: usize) {
+        let Some(h) = self.hosts.get(host) else { return };
+        self.sound.play(Sfx::Blip);
+        self.resume = Some(ResumeMenu { host, items: None, sel: 0, top: 0 });
+        let (dest, tx, wake) = (h.ssh.clone(), self.resume_tx.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((host, crate::resume::fetch(dest.as_deref())));
+            wake();
+        });
+    }
+
+    /// How many sessions the resume menu shows at once.
+    pub fn resume_rows(&self) -> usize {
+        let h = self.size.1 as f32 - self.px(48.0) - self.px(130.0);
+        ((h / self.px(48.0)) as usize).clamp(3, 14)
+    }
+
+    /// Up/down in the resume menu, scrolling to keep the pick in view.
+    pub fn resume_step(&mut self, d: isize) {
+        let rows = self.resume_rows();
+        let Some(m) = self.resume.as_mut() else { return };
+        let n = m.items.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |v| v.len());
+        if n == 0 {
+            return;
+        }
+        m.sel = (m.sel as isize + d).clamp(0, n as isize - 1) as usize;
+        if m.sel < m.top {
+            m.top = m.sel;
+        } else if m.sel >= m.top + rows {
+            m.top = m.sel + 1 - rows;
+        }
+    }
+
+    /// Resume the picked session: a new window on its host, in its folder,
+    /// with `claude --resume` typed into the shell there (so the shell's
+    /// PATH and aliases apply).
+    pub fn resume_pick(&mut self) {
+        let Some(m) = self.resume.take() else { return };
+        let Some(r) = m.items.and_then(|r| r.ok()).and_then(|v| v.into_iter().nth(m.sel)) else { return };
+        let host = m.host;
+        let cmd = r.command();
+        let label = if r.title.is_empty() { r.first.clone() } else { r.title.clone() };
+        let session = self.panes.get(self.active).filter(|p| p.host == host && p.conn.is_some()).and_then(|p| p.session.clone());
+        let conn = self.conns.iter().find(|c| c.host == host && session.as_ref().is_none_or(|s| *s == c.session)).map(|c| (c.id, c.writer.clone()));
+        match conn {
+            Some((id, w)) => {
+                self.focus_new = Some(id);
+                let dir = r.cwd.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$");
+                if dir.is_empty() {
+                    w.command(tmuxcc::Want::Ignore, "new-window");
+                } else {
+                    w.command(tmuxcc::Want::Ignore, &format!("new-window -c \"{dir}\""));
+                }
+                let hex: Vec<String> = format!("{cmd}\r").bytes().map(|b| format!("{b:02x}")).collect();
+                w.command(tmuxcc::Want::Ignore, &format!("send-keys -H {}", hex.join(" ")));
+            }
+            None if self.hosts.get(host).is_some_and(|h| h.ssh.is_none()) && !tmux_installed() => {
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".into());
+                self.spawn_pane(Spawn { program: Some(shell), args: vec!["-ic".into(), cmd], cwd: None }, host, None, true);
+            }
+            None => {
+                self.toast("RESUME // HOST NOT CONNECTED");
+                return;
+            }
+        }
+        self.sound.play(Sfx::Open);
+        self.toast(format!("RESUME // {}", truncate(&label.to_uppercase(), 50)));
+    }
+
+    /// A click while the resume menu is open: a row resumes it; elsewhere closes.
+    pub fn resume_click(&mut self, x: f32, y: f32) {
+        let rows = self.resume_rows();
+        let (pw, w, h) = (self.px(760.0), self.size.0 as f32, self.size.1 as f32);
+        let pw = pw.min(w - self.px(48.0));
+        let ph = self.px(110.0) + rows as f32 * self.px(48.0);
+        let (rx, ry) = (((w - pw) / 2.0).round(), ((h - ph) / 2.0).round());
+        let list_y = ry + self.px(84.0);
+        let row_h = self.px(48.0);
+        let Some(m) = self.resume.as_mut() else { return };
+        if x >= rx && x <= rx + pw && y >= list_y && y < list_y + rows as f32 * row_h {
+            let k = m.top + ((y - list_y) / row_h) as usize;
+            let n = m.items.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |v| v.len());
+            if k < n {
+                m.sel = k;
+                self.resume_pick();
+            }
+            return;
+        }
+        if !(x >= rx && x <= rx + pw && y >= ry && y <= ry + ph) {
+            self.resume = None;
+        }
+    }
+
     pub fn add_at(&self, x: f32, y: f32) -> Option<usize> {
         let pad = self.px(3.0);
         self.layout().adds.iter().position(|r| x >= r.x - pad && x <= r.x + r.w + pad && y >= r.y - pad && y <= r.y + r.h + pad)
     }
 
     pub fn card_at(&self, x: f32, y: f32) -> Option<usize> {
-        self.layout().cards.iter().position(|c| x >= c.x && x <= c.x + c.w && y >= c.y && y <= c.y + c.h)
+        self.layout().cards.iter().position(|c| c.w > 0.0 && x >= c.x && x <= c.x + c.w && y >= c.y && y <= c.y + c.h)
     }
 
     /// Wheel scrolling goes to the app when it wants it (mouse reporting,
@@ -1234,14 +2285,71 @@ impl App {
             p.term.lock().scroll_display(alacritty_terminal::grid::Scroll::Delta(n));
         } else if mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE) {
             let b = if n > 0 { 64 } else { 65 };
-            let ev = format!("\x1b[<{b};1;1M").repeat(n.unsigned_abs() as usize);
-            p.write(ev.into_bytes());
+            let (c, r) = self.report_cell(self.pointer.0, self.pointer.1).map_or((1, 1), |(_, c, r)| (c, r));
+            let ev = format!("\x1b[<{b};{c};{r}M").repeat(n.unsigned_abs() as usize);
+            if let Some(p) = self.panes.get(self.active) {
+                p.write(ev.into_bytes());
+            }
         } else if mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL) {
             let k = if n > 0 { "\x1bOA" } else { "\x1bOB" };
             p.write(k.repeat(n.unsigned_abs() as usize).into_bytes());
         } else {
             p.term.lock().scroll_display(alacritty_terminal::grid::Scroll::Delta(n));
         }
+    }
+
+    /// The pane under (x, y) and its cell there (1-based column, row), when
+    /// that pane's program asked for mouse reports (SGR encoding).
+    fn report_cell(&self, x: f32, y: f32) -> Option<(usize, usize, usize)> {
+        let i = self.pane_at(x, y).unwrap_or(self.active);
+        let mode = *self.panes.get(i)?.term.lock().mode();
+        if !(mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE)) {
+            return None;
+        }
+        let (p, _) = self.term_point_in(i, x, y, false)?;
+        let off = self.panes[i].term.lock().grid().display_offset() as i32;
+        Some((i, p.column.0 + 1, (p.line.0 + off).max(0) as usize + 1))
+    }
+
+    /// A button pressed (`down`) or released over a pane whose program takes
+    /// the mouse (Claude Code's fullscreen layout, vim, htop…): report it
+    /// there instead of selecting. 0 left, 1 middle, 2 right. False when the
+    /// program doesn't want clicks (a release only follows a reported press).
+    pub fn mouse_report(&mut self, x: f32, y: f32, button: u8, down: bool) -> bool {
+        if !down && self.mouse_held.is_none() {
+            return false;
+        }
+        let Some((i, c, r)) = self.report_cell(x, y).or_else(|| {
+            // A release outside the pane still ends the press it reported.
+            self.mouse_cell.filter(|_| !down).map(|(c, r)| (self.active, c, r))
+        }) else {
+            return false;
+        };
+        if down && i != self.active {
+            self.select(i);
+        }
+        self.mouse_held = down.then_some(button);
+        self.mouse_cell = Some((c, r));
+        let end = if down { 'M' } else { 'm' };
+        if let Some(p) = self.panes.get(i) {
+            p.write(format!("\x1b[<{button};{c};{r}{end}").into_bytes());
+        }
+        true
+    }
+
+    /// The pointer moved: report it to a program that wants motion (with a
+    /// button held, for drag mode), once per cell. True while a reported
+    /// press is held, so no selection starts.
+    pub fn mouse_report_motion(&mut self, x: f32, y: f32) -> bool {
+        let Some((i, c, r)) = self.report_cell(x, y) else { return self.mouse_held.is_some() };
+        let mode = *self.panes[i].term.lock().mode();
+        let wants = mode.contains(TermMode::MOUSE_MOTION) || (mode.contains(TermMode::MOUSE_DRAG) && self.mouse_held.is_some());
+        if wants && self.mouse_cell != Some((c, r)) {
+            self.mouse_cell = Some((c, r));
+            let b = self.mouse_held.unwrap_or(3) + 32;
+            self.panes[i].write(format!("\x1b[<{b};{c};{r}M").into_bytes());
+        }
+        self.mouse_held.is_some()
     }
 
     /// The cell of the active pane under (x, y), clamped to the terminal,
@@ -1268,6 +2376,68 @@ impl App {
         Some((Point::new(Line(row - term.grid().display_offset() as i32), Column(col)), side))
     }
 
+    /// The split divider at (x, y): the pane before it, and whether it
+    /// stands between side-by-side panes. A few pixels either side count.
+    pub fn divider_at(&self, x: f32, y: f32) -> Option<(usize, bool)> {
+        let g = self.group(self.active);
+        if g.len() < 2 {
+            return None;
+        }
+        let term = self.layout().term;
+        let (cw, ch) = (self.glyphs.cell_w, self.glyphs.cell_h);
+        let slop = self.px(3.0);
+        let areas: Vec<(usize, Rect)> = g.iter().map(|&j| (j, self.pane_area(j, term))).collect();
+        for &(j, a) in &areas {
+            // The divider column just right of `a`, with a pane beyond it.
+            let e = a.x + a.w;
+            let beyond = areas.iter().any(|&(k, b)| k != j && (b.x - (e + cw)).abs() < 1.5 && b.y < a.y + a.h && b.y + b.h > a.y);
+            if beyond && x >= e - slop && x <= e + cw + slop && y >= a.y && y <= a.y + a.h {
+                return Some((j, true));
+            }
+            let e = a.y + a.h;
+            let below = areas.iter().any(|&(k, b)| k != j && (b.y - (e + ch)).abs() < 1.5 && b.x < a.x + a.w && b.x + b.w > a.x);
+            if below && y >= e - slop && y <= e + ch + slop && x >= a.x && x <= a.x + a.w {
+                return Some((j, false));
+            }
+        }
+        None
+    }
+
+    /// Press on a split divider: start dragging it.
+    pub fn divider_press(&mut self, x: f32, y: f32) -> bool {
+        let Some((j, vertical)) = self.divider_at(x, y) else { return false };
+        let a = self.pane_area(j, self.layout().term);
+        let p = &self.panes[j];
+        let (origin, size) = if vertical { (a.x, p.size.cols) } else { (a.y, p.size.lines) };
+        self.divider = Some(DividerDrag { id: p.id, vertical, origin, size });
+        true
+    }
+
+    /// Dragging a divider: resize the pane before it, a cell at a time
+    /// (tmux's `resize-pane -x` / `-y`).
+    pub fn divider_drag(&mut self, x: f32, y: f32) -> bool {
+        let Some(d) = self.divider.as_mut() else { return false };
+        let (pos, cell) = if d.vertical { (x, self.glyphs.cell_w) } else { (y, self.glyphs.cell_h) };
+        let n = ((pos - d.origin) / cell).round().max(1.0) as usize;
+        if n == d.size {
+            return true;
+        }
+        d.size = n;
+        let (id, vertical) = (d.id, d.vertical);
+        let Some(p) = self.panes.iter().find(|p| p.id == id) else { return true };
+        let (Some(conn), Some(tp)) = (p.conn, p.tmux_pane.clone()) else { return true };
+        if let Some(c) = self.conns.iter().find(|c| c.id == conn) {
+            let flag = if vertical { "-x" } else { "-y" };
+            c.writer.command(tmuxcc::Want::Ignore, &format!("resize-pane -t {tp} {flag} {n}"));
+            c.writer.list_panes();
+        }
+        true
+    }
+
+    pub fn divider_release(&mut self) -> bool {
+        self.divider.take().is_some()
+    }
+
     /// Left press: start a selection in the active pane (two clicks select a
     /// word, three a line). Returns false when the press was not on it.
     pub fn mouse_down(&mut self, x: f32, y: f32) -> bool {
@@ -1283,7 +2453,18 @@ impl App {
         };
         self.last_click = Some((Instant::now(), cell, n));
         let ty = [SelectionType::Simple, SelectionType::Semantic, SelectionType::Lines][n as usize - 1];
-        self.panes[self.active].term.lock().selection = Some(Selection::new(ty, point, side));
+        let mut term = self.panes[self.active].term.lock();
+        // A double-click on a link selects all of it, across rows.
+        let link = (n == 2).then(|| crate::links::at(&term, point)).flatten();
+        term.selection = match link.as_ref().and_then(|l| Some((l.cells.first()?, l.cells.last()?))) {
+            Some((&a, &b)) => {
+                let mut sel = Selection::new(SelectionType::Simple, a, Side::Left);
+                sel.update(b, Side::Right);
+                Some(sel)
+            }
+            None => Some(Selection::new(ty, point, side)),
+        };
+        drop(term);
         self.selecting = true;
         true
     }
@@ -1313,6 +2494,46 @@ impl App {
         crate::links::at(&p.term.lock(), point).map(|l| (p.id, l))
     }
 
+    /// The rail's session list under (x, y): the wheel scrolls it there.
+    pub fn rail_list_at(&self, x: f32, y: f32) -> bool {
+        let l = self.layout();
+        x >= l.rail.x && x <= l.rail.x + l.rail.w && y >= l.rail_view.0 && y <= l.rail_view.1
+    }
+
+    /// Scroll the session list by wheel lines (positive: up).
+    pub fn scroll_rail(&mut self, lines: f32) {
+        let max = self.layout().rail_max;
+        self.rail_scroll = (self.rail_scroll - lines * self.px(28.0)).clamp(0.0, max);
+    }
+
+    /// Keep the list's scroll in range, and the active session's card in
+    /// view (after a key moved to it, say).
+    pub fn rail_follow(&mut self) {
+        let l = self.layout();
+        let mut s = self.rail_scroll.clamp(0.0, l.rail_max);
+        // Only when the active session changed: a scroll the person made
+        // away from it stays.
+        let id = self.panes.get(self.active).map(|p| p.id);
+        let moved = id != self.rail_followed;
+        self.rail_followed = id;
+        if let Some(&(y, h)) = l.spans.get(self.active).filter(|_| moved && self.shown(self.active)) {
+            let (top, bot) = l.rail_view;
+            let margin = self.px(8.0);
+            let y = y - top; // within the content
+            if y - margin < s {
+                s = (y - margin).max(0.0);
+            } else if y + h + margin > s + (bot - top) {
+                s = (y + h + margin - (bot - top)).min(l.rail_max);
+            }
+        }
+        self.rail_scroll = s;
+    }
+
+    /// Snapshots: the link at (x, y), as Ctrl+click would open it.
+    pub fn link_uri_at(&self, x: f32, y: f32) -> Option<String> {
+        self.link_at(x, y).map(|(_, l)| l.uri)
+    }
+
     /// Track the link under the pointer (only while `armed`, i.e. Ctrl is
     /// held). Returns true when that changed.
     pub fn hover_link(&mut self, x: f32, y: f32, armed: bool) -> bool {
@@ -1327,12 +2548,40 @@ impl App {
         self.hover.is_some()
     }
 
-    /// Ctrl+click: open the link at (x, y). False when there is none.
+    /// Ctrl+click: open the link at (x, y). False when there is none. A
+    /// file path opens where it is: here, or, for a session on an ssh host,
+    /// once downloaded to ~/Downloads/punkterm.
     pub fn open_link(&mut self, x: f32, y: f32) -> bool {
-        let Some((_, link)) = self.link_at(x, y) else { return false };
-        crate::links::open(&link.uri);
+        let Some((pane, link)) = self.link_at(x, y) else { return false };
         self.sound.play(Sfx::Open);
-        self.toast(format!("OPEN // {}", truncate(&link.uri, 60)));
+        if !link.is_path {
+            crate::links::open(&link.uri);
+            self.toast(format!("OPEN // {}", truncate(&link.uri, 60)));
+            return true;
+        }
+        let host = self.panes.iter().find(|p| p.id == pane).map_or(0, |p| p.host);
+        match self.hosts.get(host).and_then(|h| h.ssh.clone()) {
+            None => {
+                let path = match link.uri.strip_prefix("~/") {
+                    Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
+                    None => std::path::PathBuf::from(&link.uri),
+                };
+                if path.exists() {
+                    crate::links::open(&path.to_string_lossy());
+                    self.toast(format!("OPEN // {}", truncate(&link.uri, 60)));
+                } else {
+                    self.toast(format!("NOT FOUND // {}", truncate(&link.uri, 50)));
+                }
+            }
+            Some(spec) => {
+                self.toast(format!("DOWNLOADING // {}", truncate(&link.uri, 50)));
+                let (tx, wake, remote) = (self.dl_tx.clone(), self.wake.clone(), link.uri.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(download(&spec, &remote));
+                    wake();
+                });
+            }
+        }
         true
     }
 
@@ -1346,8 +2595,32 @@ impl App {
         }
     }
 
+    /// The selection's text, rows a program broke at the pane's width (a
+    /// long URL from Claude Code) joined back without the line break.
     pub fn selected_text(&self) -> Option<String> {
-        self.panes.get(self.active)?.term.lock().selection_to_string().filter(|t| !t.is_empty())
+        let term = self.panes.get(self.active)?.term.lock();
+        let text = term.selection_to_string().filter(|t| !t.is_empty())?;
+        let Some(range) = term.selection.as_ref().and_then(|s| s.to_range(&term)).filter(|r| !r.is_block) else { return Some(text) };
+        let grid = term.grid();
+        let cols = term.columns();
+        let ink = |l: i32, c: usize| !grid[Line(l)][Column(c)].c.is_whitespace();
+        // One flag per line break in the text, in order: rows the terminal
+        // wrapped have none.
+        let mut joins = Vec::new();
+        for l in range.start.line.0..range.end.line.0 {
+            if grid[Line(l)][Column(cols - 1)].flags.contains(Flags::WRAPLINE) {
+                continue;
+            }
+            joins.push(ink(l, cols - 1) && ink(l + 1, 0));
+        }
+        let mut out = String::with_capacity(text.len());
+        for (k, part) in text.split('\n').enumerate() {
+            if k > 0 && !joins.get(k - 1).copied().unwrap_or(false) {
+                out.push('\n');
+            }
+            out.push_str(part);
+        }
+        Some(out)
     }
 
     pub fn clear_selection(&mut self) {
@@ -1425,6 +2698,83 @@ impl App {
                 _ => {}
             }
         }
+        // The active session's remote host's CPU and memory, every 3 s
+        // (one ssh round trip through the shared connection).
+        let h = self.active_host();
+        if h > 0 && self.host_state.get(h) == Some(&HostState::Up) && self.host_sys_asked.is_none_or(|t| t.elapsed().as_secs() >= 3) {
+            self.host_sys_asked = Some(Instant::now());
+            if let Some(spec) = self.hosts[h].ssh.clone() {
+                let (tx, wake) = (self.host_sys_tx.clone(), self.wake.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send((h, crate::sysstat::remote(&spec)));
+                    wake();
+                });
+            }
+        }
+        while let Ok((h, v)) = self.host_sys_rx.try_recv() {
+            match v {
+                Some(load) => {
+                    self.host_sys.insert(h, (load, Instant::now()));
+                }
+                None => {
+                    self.host_sys.remove(&h);
+                }
+            }
+            dirty = true;
+        }
+        // Image files read for panes: decode, and answer the program.
+        while let Ok((id, req, data)) = self.img_rx.try_recv() {
+            if let Some(p) = self.panes.iter_mut().find(|p| p.id == id) {
+                if let Some(reply) = p.graphics.file_arrived(req, data) {
+                    p.write(reply.into_bytes());
+                }
+            }
+            dirty = true;
+        }
+        // A host's recent sessions, for the resume menu.
+        while let Ok((host, r)) = self.resume_rx.try_recv() {
+            if let Some(m) = self.resume.as_mut().filter(|m| m.host == host) {
+                m.items = Some(r);
+            }
+            dirty = true;
+        }
+        // Files fetched by Ctrl+click: open them.
+        while let Ok(r) = self.dl_rx.try_recv() {
+            match r {
+                Ok(path) => {
+                    crate::links::open(&path.to_string_lossy());
+                    let home = dirs::home_dir().unwrap_or_default();
+                    let shown = path.strip_prefix(&home).map_or(path.to_string_lossy().into_owned(), |p| format!("~/{}", p.to_string_lossy()));
+                    self.toast(format!("SAVED // {}", truncate(&shown, 60)));
+                }
+                Err(e) => self.toast(format!("DOWNLOAD // {}", e.to_uppercase())),
+            }
+            dirty = true;
+        }
+        // Images pasted to a remote host: paste their path once copied there.
+        while let Ok((id, r)) = self.paste_rx.try_recv() {
+            match r {
+                Ok(path) => {
+                    if let Some(i) = self.panes.iter().position(|p| p.id == id) {
+                        self.paste_text(i, &path);
+                        self.toast("IMAGE // PASTED");
+                    }
+                }
+                Err(e) => self.toast(format!("IMAGE // {}", e.to_uppercase())),
+            }
+            dirty = true;
+        }
+        // Panes resized a moment ago: re-read them from tmux.
+        let now = Instant::now();
+        for p in self.panes.iter_mut().filter(|p| p.resync_at.is_some_and(|t| now >= t)) {
+            p.resync_at = None;
+            let (Some(conn), Some(tp)) = (p.conn, p.tmux_pane.clone()) else { continue };
+            if let Some(c) = self.conns.iter().find(|c| c.id == conn) {
+                p.awaiting_capture = true;
+                p.term.lock().scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+                c.writer.capture(&tp);
+            }
+        }
         // Plan usage: every minute, for every reachable host.
         if self.last_usage.is_none_or(|t| t.elapsed().as_secs() >= 60) {
             self.last_usage = Some(Instant::now());
@@ -1451,6 +2801,12 @@ impl App {
             let old = self.usage.get(&host);
             let rail_changed = old.and_then(|u| u.rail_width) != u.as_ref().and_then(|u| u.rail_width)
                 || old.map(|u| &u.names) != u.as_ref().map(|u| &u.names);
+            if let Some(u) = &u {
+                let name = self.hosts.get(host).map_or(String::new(), |h| h.name.clone());
+                if crate::usage::remember(&mut self.known, &name, u) && self.persist {
+                    crate::usage::save_known(&self.known);
+                }
+            }
             match u {
                 Some(u) => self.usage.insert(host, u),
                 None => self.usage.remove(&host),
@@ -1493,6 +2849,7 @@ impl App {
                     if let Some(i) = self.panes.iter().position(|p| p.conn == Some(conn) && p.tmux_pane.as_deref() == Some(pane.as_str())) {
                         if !self.panes[i].awaiting_capture {
                             self.panes[i].feed(&data);
+                            self.read_image_files(i);
                             if i != active {
                                 self.ui[i].unseen = true;
                             }
@@ -1502,6 +2859,7 @@ impl App {
                 CcEvent::Reply { conn, want, lines } => match want {
                     tmuxcc::Want::Panes => self.sync_panes(conn, &lines),
                     tmuxcc::Want::Capture(pane) => self.apply_capture(conn, &pane, &lines),
+                    tmuxcc::Want::Cursor(pane) => self.apply_cursor(conn, &pane, &lines),
                     tmuxcc::Want::Ignore => {}
                 },
                 CcEvent::Changed { conn } => {
@@ -1533,12 +2891,13 @@ impl App {
             dirty |= self.detect();
         }
         // Drop exited panes, keeping the selection on a neighbour.
-        while let Some(i) = self.panes.iter().position(|p| p.exited) {
-            self.panes.remove(i);
-            self.ui.remove(i);
-            if self.active >= i && self.active > 0 {
-                self.active -= 1;
+        if self.panes.iter().any(|p| p.exited) {
+            let next = self.successor(|j| self.panes[j].exited);
+            while let Some(i) = self.panes.iter().position(|p| p.exited) {
+                self.panes.remove(i);
+                self.ui.remove(i);
             }
+            self.active = next.and_then(|id| self.panes.iter().position(|p| p.id == id)).unwrap_or(0);
             self.transition = None;
             if self.panes.is_empty() {
                 self.quit = true;
@@ -1622,7 +2981,7 @@ impl App {
         for want in [Status::Blocked, Status::YourTurn] {
             for k in 1..=n {
                 let i = (self.active + k) % n;
-                if self.ui[i].status == want && i != self.active {
+                if self.ui[i].status == want && i != self.active && self.shown(i) {
                     self.select(i);
                     return;
                 }
@@ -1724,6 +3083,9 @@ impl App {
         let lines = term.screen_lines();
 
         let mut cells: Vec<(f32, f32, char, Option<String>, Rgba, Option<Rgba>, Flags)> = Vec::with_capacity(term.columns() * lines);
+        // Image placeholder cells: (x, y, image id, row, column in it).
+        let mut slices: Vec<(f32, f32, u32, u32, u32)> = Vec::new();
+        let mut last: Option<(i32, usize, u32, u32, u32)> = None;
         for cell in content.display_iter {
             let row = cell.point.line.0 + offset;
             if row < 0 || row as usize >= lines {
@@ -1731,6 +3093,27 @@ impl App {
             }
             let x = ox + cell.point.column.0 as f32 * cw;
             let y = oy + row as f32 * ch;
+            if cell.c == crate::graphics::PLACEHOLDER {
+                // The image id is the foreground colour; combining marks
+                // give row, column and the id's top byte. Missing ones
+                // follow on from the cell to the left.
+                let id = match cell.fg {
+                    Color::Spec(c) => (c.r as u32) << 16 | (c.g as u32) << 8 | c.b as u32,
+                    Color::Indexed(i) => i as u32,
+                    Color::Named(_) => 0,
+                };
+                let marks: Vec<u32> = cell.zerowidth().into_iter().flatten().filter_map(|&z| crate::graphics::diacritic(z)).collect();
+                let id = id | marks.get(2).map_or(0, |h| h << 24);
+                let col_i = cell.point.column.0;
+                let prev = last.filter(|&(l, c, pid, _, _)| l == row && c + 1 == col_i && pid == id);
+                let r = marks.first().copied().or(prev.map(|p| p.3)).unwrap_or(0);
+                let c = marks.get(1).copied().or(prev.filter(|p| p.3 == r).map(|p| p.4 + 1)).unwrap_or(0);
+                last = Some((row, col_i, id, r, c));
+                slices.push((x, y, id, r, c));
+                let bg = self.resolve(cell.bg, colors, true);
+                cells.push((x, y, ' ', None, t.fg, bg, cell.flags));
+                continue;
+            }
             let mut fg = self.resolve(cell.fg, colors, false).unwrap_or(t.fg);
             let mut bg = self.resolve(cell.bg, colors, true);
             if cell.flags.contains(Flags::INVERSE) {
@@ -1771,6 +3154,39 @@ impl App {
         }
         if let Some((rx, ry, rw, rc)) = run {
             self.rect(q, Rect { x: rx, y: ry, w: rw, h: ch }, with_alpha(rc, alpha), 0.0, clip);
+        }
+
+        // Inline images: each placeholder cell shows its part of the image,
+        // fitted (aspect kept, centred) into the placement's cells.
+        for (x, y, id, r, c) in slices {
+            let Some(img) = self.panes[idx].graphics.images.get(&id) else { continue };
+            let (iw, ih) = (img.w as f32, img.h as f32);
+            let (cols, rows) = match (img.cols, img.rows) {
+                (0, 0) => ((iw / cw).ceil(), (ih / ch).ceil()),
+                (0, rr) => (((rr as f32 * ch) * iw / ih / cw).ceil(), rr as f32),
+                (cc, 0) => (cc as f32, ((cc as f32 * cw) * ih / iw / ch).ceil()),
+                (cc, rr) => (cc as f32, rr as f32),
+            };
+            let (bw, bh) = (cols * cw, rows * ch);
+            let s = (bw / iw).min(bh / ih);
+            let (dw, dh) = (iw * s, ih * s);
+            let (dx0, dy0) = ((bw - dw) / 2.0, (bh - dh) / 2.0);
+            let (cx0, cy0) = (c as f32 * cw, r as f32 * ch);
+            let (x0, y0) = (cx0.max(dx0), cy0.max(dy0));
+            let (x1, y1) = ((cx0 + cw).min(dx0 + dw), (cy0 + ch).min(dy0 + dh));
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            let Some(a) = self.image_atlas.place(pane_id, id, img) else { continue };
+            let uv = [a[0] + (x0 - dx0) / s, a[1] + (y0 - dy0) / s, (x1 - x0) / s, (y1 - y0) / s];
+            q.push(Quad {
+                rect: [x + x0 - cx0, y + y0 - cy0, x1 - x0, y1 - y0],
+                uv,
+                color: [1.0, 1.0, 1.0, alpha],
+                params: [kind::IMAGE, 0.0, 0.0, 0.0],
+                clip,
+                ..Default::default()
+            });
         }
 
         // Cursor (block/beam/underline), springing between cells.
@@ -1995,6 +3411,56 @@ fn tmux_installed() -> bool {
 }
 
 /// tmux's default pane title is the host name; that is no title at all.
+/// The modes to restore on a pane after a capture: tmux's record, and
+/// bracketed paste for Claude Code (which always asks for it; tmux keeps no
+/// flag for it), so a multi-line paste stays one paste.
+fn pane_modes(info: &tmuxcc::PaneInfo) -> String {
+    let mut m = info.mode_sequences();
+    if info.command == "claude" {
+        m.push_str("\x1b[?2004h");
+    }
+    m
+}
+
+/// Copy `remote` (a path on the ssh host `spec`) to ~/Downloads/punkterm,
+/// under a name not taken there yet.
+fn download(spec: &str, remote: &str) -> Result<std::path::PathBuf, String> {
+    let dir = dirs::download_dir().or_else(|| dirs::home_dir().map(|h| h.join("Downloads"))).ok_or("no downloads folder")?.join("punkterm");
+    std::fs::create_dir_all(&dir).map_err(|_| "cannot make ~/Downloads/punkterm")?;
+    let name = remote.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("download");
+    let (stem, ext) = match name.rfind('.').filter(|&k| k > 0) {
+        Some(k) => (&name[..k], &name[k..]),
+        None => (name, ""),
+    };
+    let dest = (0..1000).map(|n| if n == 0 { dir.join(name) } else { dir.join(format!("{stem}-{n}{ext}")) }).find(|p| !p.exists()).ok_or("too many copies")?;
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let target = match remote.strip_prefix("~/") {
+        Some(rest) => format!("\"$HOME\"/{}", quote(rest)),
+        None => quote(remote),
+    };
+    let file = std::fs::File::create(&dest).map_err(|_| "cannot write the file")?;
+    let ok = std::process::Command::new("ssh")
+        .args(crate::tmuxcc::ssh_args(spec))
+        .arg(format!("test -f {target} && cat -- {target}"))
+        .stdin(std::process::Stdio::null())
+        .stdout(file)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        let _ = std::fs::remove_file(&dest);
+        return Err("not a file on the host, or unreadable".into());
+    }
+    Ok(dest)
+}
+
+/// A pane title that is really a kitty graphics command (`Ga=T,…;…`), set by
+/// tmux, which reads any APC sequence as a title.
+fn is_graphics_title(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() > 3 && b[0] == b'G' && b[1].is_ascii_alphabetic() && b[2] == b'=' && (t.contains(';') || t.contains(','))
+}
+
 fn is_hostname_like(t: &str) -> bool {
     !t.contains(' ') && (t.starts_with("ip-") || t.contains(".internal") || t.contains(".local"))
 }
@@ -2033,5 +3499,18 @@ fn ago(t: Instant) -> String {
         0..=59 => "now".into(),
         60..=3599 => format!("{}m", s / 60),
         _ => format!("{}h", s / 3600),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graphics_titles() {
+        assert!(is_graphics_title("Ga=T,U=1,q=2,f=100,i=7;iVBORw0KGgo"));
+        assert!(is_graphics_title("Gm=0;mfKg/5vyoP+d8qD"));
+        assert!(!is_graphics_title("Git status"));
+        assert!(!is_graphics_title("✳ Example screenshot"));
     }
 }

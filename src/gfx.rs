@@ -1,4 +1,5 @@
-//! The GPU side: a single instanced-quad pipeline plus the glyph atlas texture.
+//! The GPU side: a single instanced-quad pipeline plus the glyph atlas texture,
+//! and a second atlas for inline images.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -25,6 +26,8 @@ pub mod kind {
     pub const GRADIENT_STROKE: f32 = 6.0;
     pub const DOTS: f32 = 7.0;
     pub const GLOW: f32 = 8.0;
+    /// A slice of the image atlas: `uv` is its rect there (px), scaled to the quad.
+    pub const IMAGE: f32 = 9.0;
 }
 
 #[repr(C)]
@@ -50,6 +53,7 @@ pub struct Renderer {
     bind_group: wgpu::BindGroup,
     globals: wgpu::Buffer,
     atlas: wgpu::Texture,
+    images: wgpu::Texture,
     instances: wgpu::Buffer,
     capacity: usize,
 }
@@ -77,6 +81,23 @@ impl Renderer {
             view_formats: &[],
         });
         let atlas_view = atlas.create_view(&Default::default());
+        let images = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("images"),
+            size: wgpu::Extent3d { width: ATLAS_SIZE, height: ATLAS_SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let images_view = images.create_view(&Default::default());
+        // Images are scaled to their cells: smooth them.
+        let images_smp = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         // Glyphs are drawn 1:1 at integer positions, so nearest sampling keeps
         // them exactly as rasterized.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -113,6 +134,22 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -122,6 +159,8 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&atlas_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&images_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&images_smp) },
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -175,7 +214,7 @@ impl Renderer {
         });
         let capacity = 16 * 1024;
         let instances = Self::instance_buffer(&device, capacity);
-        Renderer { device, queue, pipeline, bind_group, globals, atlas, instances, capacity }
+        Renderer { device, queue, pipeline, bind_group, globals, atlas, images, instances, capacity }
     }
 
     fn instance_buffer(device: &wgpu::Device, n: usize) -> wgpu::Buffer {
@@ -188,13 +227,22 @@ impl Renderer {
     }
 
     pub fn upload(&self, ups: &mut Vec<Upload>) {
+        self.upload_to(&self.atlas, ups);
+    }
+
+    /// Into the image atlas.
+    pub fn upload_images(&self, ups: &mut Vec<Upload>) {
+        self.upload_to(&self.images, ups);
+    }
+
+    fn upload_to(&self, texture: &wgpu::Texture, ups: &mut Vec<Upload>) {
         for u in ups.drain(..) {
             if u.w == 0 || u.h == 0 {
                 continue;
             }
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
-                    texture: &self.atlas,
+                    texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d { x: u.x, y: u.y, z: 0 },
                     aspect: wgpu::TextureAspect::All,

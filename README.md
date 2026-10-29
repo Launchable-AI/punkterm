@@ -28,8 +28,14 @@ alongside it: punkterm never edits your tmux, shell or terminal configs.
   the session's transcript on its host. Click an entry to scroll the terminal
   back to it.
 - **Dashboard.** **Ctrl+Shift+D** shows every session as a live tile.
+- **Inline images.** Images Claude Code draws with the kitty graphics protocol
+  show in place, through tmux and over ssh (see [docs/images.md](docs/images.md));
+  the bundled [show-image](claude-plugin/show-image/README.md) plugin lets Claude show any PNG.
+  Images pasted with Ctrl+V reach Claude on ssh hosts too ([docs/paste.md](docs/paste.md)).
 - **Plan usage.** The signed-in account and its 5-hour and weekly limits, read
-  from Claude Code's own cache on the active session's host.
+  from Claude Code's own cache on the active session's host. **Ctrl+Shift+U** (or ALL › in
+  PLAN) shows every account across your hosts at once; a host running several
+  accounts (`CLAUDE_CONFIG_DIR`) shows each, and each session's account.
 - **cc-rail friendly.** Windows that pair a session with a cc-rail rail are
   sized so the session
   fills punkterm's panel and the rail keeps its width.
@@ -74,16 +80,24 @@ Remote hosts need tmux; the Claude features also need `python3`.
 
 | Keys | |
 |---|---|
-| Ctrl+Shift+T / E | New shell on this host / split beside this pane |
+| Ctrl+Shift+T | New shell on this host |
+| Ctrl+Shift+V / " | Split side by side / stacked |
+| Shift+Insert, middle-click | Paste the clipboard, the selection |
+| Ctrl+V (Claude on an ssh host) | Paste a clipboard image: copied to the host, attached ([docs/paste.md](docs/paste.md)) |
 | Ctrl+] / Ctrl+[ | Next / previous session |
-| Ctrl+Shift+1–9 | Jump to a session |
+| Ctrl+Shift+1–9, Ctrl+Space 1 2 | Jump to a session by its number (12 and up too) |
 | Ctrl+Shift+Space | Next session that needs you |
 | Ctrl+Shift+D | Dashboard |
 | Ctrl+Shift+H | Conversation timeline |
+| Ctrl+Shift+U | Plan usage for every account on your hosts |
+| ↺ beside a host | Resume one of its recent Claude sessions |
 | Ctrl+Shift+N / R | Connect to a host / reconnect |
 | Ctrl+Shift+P / O | Cycle theme / opacity |
 | Ctrl+= / Ctrl+- | Text size |
 | Ctrl+Space, then v s hjkl z | tmux-style splits and pane moves |
+| Ctrl+click a card | Join that session beside this one (tmux `join-pane`) |
+| Shift+click cards, Ctrl+Space g | Group sessions; click a group's header to roll it up |
+| Right-click a card or group header | Menu: join, split, fork Claude, group, detach… |
 
 ## Themes
 

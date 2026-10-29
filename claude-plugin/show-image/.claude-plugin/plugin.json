@@ -1,0 +1,6 @@
+{
+  "name": "show-image",
+  "version": "0.2.0",
+  "description": "Show PNG images inline in the chat: a show_image tool for Claude and a /show command",
+  "license": "MIT"
+}

@@ -1,0 +1,11 @@
+{
+  "name": "punkterm",
+  "owner": { "name": "Launchable AI" },
+  "plugins": [
+    {
+      "name": "show-image",
+      "source": "./claude-plugin/show-image",
+      "description": "Show PNG images inline in the chat: a show_image tool for Claude and a /show command"
+    }
+  ]
+}

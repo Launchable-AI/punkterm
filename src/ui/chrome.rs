@@ -60,6 +60,8 @@ impl App {
         let dt = (now - self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         self.dt = dt;
+        self.rail_follow();
+        self.image_atlas.begin_frame();
         self.sys.tick();
         if let Some((from, t0)) = &self.theme_from {
             let p = t0.elapsed().as_secs_f32() / 0.45;
@@ -121,6 +123,9 @@ impl App {
 
         self.overview_layer(&mut q, dt, &mut animating);
         self.toast_layer(&mut q, &l, &mut animating);
+        self.menu_layer(&mut q);
+        self.usage_layer(&mut q, dt, &mut animating);
+        self.resume_layer(&mut q);
         self.help_layer(&mut q, dt, &mut animating);
         self.prompt_layer(&mut q, dt, &mut animating);
         (q, animating)
@@ -268,8 +273,9 @@ impl App {
     /// Segmented meter, slanted segments; colour climbs with the value.
     fn meter(&mut self, q: &mut Vec<Quad>, x: f32, y: f32, w: f32, v: f32) {
         let t = self.theme.clone();
-        let n = 24;
         let gap = self.px(2.0);
+        // Up to 24 segments, fewer when narrow (each at least 4 px wide).
+        let n = (((w + gap) / (self.px(4.0) + gap)) as usize).clamp(4, 24);
         let sw = ((w - gap * (n - 1) as f32) / n as f32).floor();
         let h = self.px(6.0);
         let lit = (v.clamp(0.0, 1.0) * n as f32).round() as usize;
@@ -491,9 +497,14 @@ impl App {
             let (cx, cy) = ((a.x + a.w / 2.0).round(), (a.y + a.h / 2.0).round());
             self.rect(q, Rect { x: cx - arm, y: cy - th / 2.0, w: 2.0 * arm, h: th }, hcol, 0.0, NO_CLIP);
             self.rect(q, Rect { x: cx - th / 2.0, y: cy - arm, w: th, h: 2.0 * arm }, hcol, 0.0, NO_CLIP);
+            // "↺": recent Claude sessions on this host, to resume one.
+            let b = l.resumes[h];
+            self.shape(q, b, with_alpha(hcol, 0.13), Some(with_alpha(hcol, 0.65)), [cut, 0.0, cut, 0.0]);
+            let gw = self.measure("↺", Font::Ui, 11.0, 700, 0.0);
+            self.label(q, "↺", Font::Ui, 11.0, 700, 0.0, (b.x + (b.w - gw) / 2.0).round(), b.y + self.px(1.0), hcol);
             let count = format!("{k:02} SES");
             let cw = self.measure(&count, Font::Mono, 9.5, 500, 1.0);
-            let count_r = a.x - self.px(8.0);
+            let count_r = b.x - self.px(8.0);
             self.label(q, &count, Font::Mono, 9.5, 500, 1.0, count_r - cw, sy, t.muted);
             let lx = hx + hw + self.px(10.0);
             let lw = count_r - cw - self.px(10.0) - lx;
@@ -512,8 +523,17 @@ impl App {
             }
         }
 
+        // More of the session list above or below the band it scrolls in.
+        let (vt, vb) = l.rail_view;
+        for (on, yy, glyph) in [(l.rail_more.0, vt - self.px(14.0), "↑ MORE"), (l.rail_more.1, vb - self.px(2.0), "↓ MORE")] {
+            if on {
+                let w = self.measure(glyph, Font::Mono, 8.5, 700, 1.2);
+                self.label(q, glyph, Font::Mono, 8.5, 700, 1.2, r.x + (r.w - w) / 2.0, yy, with_alpha(t.accent2, 0.85));
+            }
+        }
+
         // Active indicator glides between cards.
-        if let Some(card) = l.cards.get(self.active) {
+        if let Some(card) = l.cards.get(self.active).filter(|c| c.w > 0.0) {
             if self.indicator.target == 0.0 && self.indicator.value == 0.0 {
                 self.indicator.snap(card.y);
             }
@@ -522,9 +542,56 @@ impl App {
         *animating |= self.indicator.step(dt);
         let time = self.epoch.elapsed().as_secs_f32();
 
+        // Group headers: chevron, name, how many, and their sessions'
+        // status (most urgent first), which matters most when rolled up.
+        for &(g, h, r) in &l.heads {
+            let gr = self.groups[g].clone();
+            let members: Vec<usize> = (0..n).filter(|&i| self.panes[i].host == h && self.group_of(i) == Some(g)).collect();
+            let hcol = self.host_color(h);
+            let cut = self.px(6.0);
+            self.shape(q, r, with_alpha(hcol, if gr.collapsed { 0.10 } else { 0.05 }), Some(with_alpha(hcol, 0.35)), [cut, 0.0, 0.0, 0.0]);
+            let cy = r.y + self.px(5.0);
+            let chev = if gr.collapsed { "▸" } else { "▾" };
+            let cw = self.label(q, chev, Font::Mono, 10.0, 700, 0.0, r.x + self.px(8.0), cy, hcol);
+            let nx = r.x + self.px(8.0) + cw + self.px(6.0);
+            // FULL / BRIEF switch (while expanded), then the count.
+            let mut end = r.x + r.w - self.px(8.0);
+            if !gr.collapsed {
+                let b = self.brief_switch(r);
+                let word = if gr.brief { "BRIEF" } else { "FULL" };
+                self.shape(q, b, with_alpha(hcol, 0.12), Some(with_alpha(hcol, 0.55)), [self.px(4.0), 0.0, 0.0, 0.0]);
+                let ww = self.measure(word, Font::Mono, 8.0, 700, 1.0);
+                self.label(q, word, Font::Mono, 8.0, 700, 1.0, b.x + (b.w - ww) / 2.0, b.y + self.px(3.0), hcol);
+                end = b.x - self.px(8.0);
+            }
+            let count = format!("{:02}", members.len());
+            let count_w = self.measure(&count, Font::Mono, 9.5, 500, 1.0);
+            let mut rx = end - count_w;
+            self.label(q, &count, Font::Mono, 9.5, 500, 1.0, rx, cy, t.muted);
+            for st in [Status::Blocked, Status::YourTurn, Status::Working] {
+                let k = members.iter().filter(|&&i| self.ui[i].status == st).count();
+                if k == 0 {
+                    continue;
+                }
+                let col = self.status_color(st);
+                let s = format!("{k}");
+                rx -= self.px(10.0) + self.measure(&s, Font::Mono, 9.5, 700, 0.0);
+                self.label(q, &s, Font::Mono, 9.5, 700, 0.0, rx, cy, col);
+                let d = self.px(5.0);
+                rx -= d + self.px(4.0);
+                self.shape(q, Rect { x: rx, y: r.y + r.h / 2.0 - d / 2.0, w: d, h: d }, col, None, [d / 2.0, 0.0, d / 2.0, 0.0]);
+            }
+            let name = self.fit(&gr.name.to_uppercase(), Font::Ui, 10.0, 700, rx - nx - self.px(8.0));
+            self.label(q, &name, Font::Ui, 10.0, 700, 2.0, nx, cy, if gr.collapsed { t.muted } else { t.fg });
+        }
+
         for i in 0..n {
             let card = l.cards[i];
+            if card.w <= 0.0 {
+                continue;
+            }
             let active = i == self.active;
+            let picked = self.picked.contains(&self.panes[i].id);
             let ui = &mut self.ui[i];
             if ui.appear < 1.0 {
                 ui.appear = (ui.appear + dt / 0.3).min(1.0);
@@ -553,6 +620,9 @@ impl App {
             if bell > 0.0 {
                 self.shape(q, c, with_alpha(t.accent, 0.22 * bell), None, [cut, 0.0, 0.0, 0.0]);
             }
+            if picked {
+                self.shape(q, c, with_alpha(t.accent2, 0.10), Some(with_alpha(t.accent2, 0.9)), [cut, 0.0, 0.0, 0.0]);
+            }
 
             let p = &self.panes[i];
             let title = if p.title.is_empty() { p.subtitle.clone() } else { super::clean_title(&p.title) };
@@ -578,7 +648,7 @@ impl App {
 
             let emphasis = active || unseen || matches!(status, Status::Blocked | Status::YourTurn);
             let fg = with_alpha(if emphasis { t.fg } else { mix(t.fg, t.muted, 0.35) }, appear);
-            let num = format!("{:02}", i + 1);
+            let num = format!("{:02}", self.ordinal(i));
             let ncol = if active { t.accent } else { with_alpha(t.muted, 0.8) };
             let compact = c.h < self.px(40.0);
             let row_y = if compact { c.y + self.px(7.0) } else { c.y + self.px(11.0) };
@@ -586,7 +656,20 @@ impl App {
 
             let tx = c.x + self.px(42.0);
             let chip_w = if status == Status::Shell { self.px(16.0) } else { self.px(66.0) };
-            let clip = [tx, c.y, c.x + c.w - chip_w - self.px(10.0), c.y + c.h];
+            // Which account the session's Claude runs as, where the host has
+            // several (CLAUDE_CONFIG_DIR configs): a tag before the chip.
+            let acct = self.usage.get(&self.panes[i].host).filter(|u| u.accounts.len() > 1).and_then(|u| {
+                self.panes[i].tmux_pane.as_deref().and_then(|tp| u.account_of(tp)).map(|a| a.short())
+            });
+            let mut tag_w = 0.0;
+            if let Some(tag) = acct {
+                let tag = self.fit(&tag, Font::Mono, 9.0, 600, self.px(70.0));
+                let w = self.measure(&tag, Font::Mono, 9.0, 600, 0.4);
+                let ty = if compact { c.y + c.h / 2.0 - self.px(6.0) } else { c.y + self.px(13.0) };
+                self.label(q, &tag, Font::Mono, 9.0, 600, 0.4, c.x + c.w - chip_w - self.px(14.0) - w, ty, with_alpha(t.accent2, appear));
+                tag_w = w + self.px(8.0);
+            }
+            let clip = [tx, c.y, c.x + c.w - chip_w - self.px(10.0) - tag_w, c.y + c.h];
             let weight = if emphasis { 600 } else { 500 };
             let title = self.fit(&title, Font::Ui, 13.0, weight, clip[2] - tx);
             let title_l = self.glyphs.text(&title, Font::Ui, self.px(13.0), weight, 0.0);
@@ -629,6 +712,10 @@ impl App {
             while j + 1 < n && self.split_key(j + 1) == Some(key) {
                 j += 1;
             }
+            if l.cards[i].w <= 0.0 {
+                i = j + 1;
+                continue;
+            }
             let (top, bot) = (l.cards[i].y + self.px(6.0), l.cards[j].y + l.cards[j].h - self.px(6.0));
             let on = (i..=j).contains(&self.active);
             let col = if on { with_alpha(t.accent, 0.8) } else { with_alpha(t.muted, 0.6) };
@@ -641,76 +728,160 @@ impl App {
             i = j + 1;
         }
 
-        if !l.cards.is_empty() {
-            let c = l.cards[self.active.min(l.cards.len() - 1)];
+        // A card being dragged: outline where it would land, and carry its
+        // name under the pointer.
+        if let Some((id, (mx, my))) = self.card_drag.as_ref().filter(|d| d.moving).map(|d| (d.id, d.at)) {
+            let target = self.drop_target(mx, my);
+            let span: Vec<Rect> = match target {
+                Some(Some(g)) => l.heads.iter().filter(|h| h.0 == g).map(|h| h.2).chain((0..n).filter(|&j| self.group_of(j) == Some(g) && l.cards[j].w > 0.0).map(|j| l.cards[j])).collect(),
+                Some(None) => (0..n).filter(|&j| self.group_of(j).is_none() && l.cards[j].w > 0.0).map(|j| l.cards[j]).collect(),
+                None => Vec::new(),
+            };
+            if let (Some(top), Some(bot)) = (span.iter().map(|r| r.y).reduce(f32::min), span.iter().map(|r| r.y + r.h).reduce(f32::max)) {
+                let a = Rect { x: span[0].x - self.px(3.0), y: top - self.px(3.0), w: span[0].w + self.px(6.0), h: bot - top + self.px(6.0) };
+                self.shape(q, a, with_alpha(t.accent2, 0.06), Some(with_alpha(t.accent2, 0.9)), [self.px(8.0), 0.0, 0.0, 0.0]);
+            }
+            if let Some(p) = self.panes.iter().find(|p| p.id == id) {
+                let title = if p.title.is_empty() { p.subtitle.clone() } else { super::clean_title(&p.title) };
+                let title = self.fit(&title, Font::Ui, 12.0, 600, self.px(180.0));
+                let w = self.measure(&title, Font::Ui, 12.0, 600, 0.0) + self.px(24.0);
+                let g = Rect { x: mx + self.px(12.0), y: my - self.px(12.0), w, h: self.px(26.0) };
+                self.shape(q, g, with_alpha(t.surface_alt, 0.95), Some(t.accent), [self.px(6.0), 0.0, 0.0, 0.0]);
+                self.label(q, &title, Font::Ui, 12.0, 600, 0.0, g.x + self.px(12.0), g.y + self.px(6.0), t.fg);
+            }
+        }
+
+        if l.cards.get(self.active).is_some_and(|c| c.w > 0.0) {
+            let c = l.cards[self.active];
             let inset = if c.h < self.px(40.0) { self.px(8.0) } else { self.px(14.0) };
             let ih = c.h - inset - self.px(10.0);
             self.rect(q, Rect { x: c.x, y: self.indicator.value + inset, w: self.px(2.0), h: ih }, t.accent, 0.0, NO_CLIP);
         }
 
-        // Footer: live meters, then key hints.
-        let fy = r.y + r.h - self.px(108.0);
-        // Claude plan usage for the active host's account, as /usage shows it.
-        if let Some((host, u)) = self.plan() {
-            let py = fy - self.plan_h();
-            self.rect(q, Rect { x, y: py, w: right - x, h: self.px(1.0).max(1.0) }, t.border, 0.0, NO_CLIP);
-            let _ = host;
-            let age = crate::usage::now_ms().saturating_sub(u.at_ms) / 60_000;
-            // Claude Code refreshes these only while sessions make requests.
-            let stale = match age {
-                0..15 => String::new(),
-                15..120 => format!("{age}M AGO"),
-                120..2880 => format!("{}H AGO", age / 60),
-                _ => format!("{}D AGO", age / 1440),
-            };
-            // PLAN // account email, then the reading's age when it is stale.
-            let mut hx = x + self.meta(q, &["PLAN"], x, py + self.px(12.0), t.muted);
-            let tail_w = if stale.is_empty() { 0.0 } else { self.measure(&stale, Font::Mono, 9.5, 500, 1.2) + self.px(28.0) };
-            if let Some(email) = &u.account {
-                hx += self.px(7.0);
-                hx += self.label(q, "//", Font::Mono, 9.5, 600, 0.0, hx, py + self.px(12.0), with_alpha(t.accent, 0.8)) + self.px(7.0);
-                let e = self.fit(email, Font::Mono, 9.5, 500, right - hx - tail_w);
-                hx += self.label(q, &e, Font::Mono, 9.5, 500, 0.0, hx, py + self.px(12.0), mix(t.fg, t.muted, 0.35));
+        // Footer: PLAN (every account on the session's host) and LOAD, each
+        // folding to a line per account or host; then key hints.
+        let (py, ly) = self.footer_tops();
+        let head = |this: &mut Self, q: &mut Vec<Quad>, y: f32, name: &str, folded: bool| {
+            this.rect(q, Rect { x, y, w: right - x, h: this.px(1.0).max(1.0) }, t.border, 0.0, NO_CLIP);
+            let w = this.meta(q, &[name], x, y + this.px(10.0), t.muted);
+            this.label(q, if folded { "▸" } else { "▾" }, Font::Ui, 11.0, 700, 0.0, x + w + this.px(6.0), y + this.px(7.0), t.muted);
+        };
+        let pct_text = |row: &crate::usage::Row| {
+            let reset = row.resets_ms != 0 && row.resets_ms <= crate::usage::now_ms();
+            (reset, if reset { 0.0 } else { row.pct / 100.0 })
+        };
+        let lines = self.plan_lines();
+        let mut y = py;
+        for line in &lines {
+            let lh = self.plan_line_h(line);
+            match line {
+                crate::ui::PlanLine::Head => {
+                    head(self, q, y, "PLAN", self.plan_collapsed);
+                    let all = "ALL ›";
+                    let aw = self.measure(all, Font::Mono, 9.5, 600, 1.2);
+                    self.label(q, all, Font::Mono, 9.5, 600, 1.2, right - aw, y + self.px(10.0), t.accent2);
+                }
+                crate::ui::PlanLine::Account(a, active) | crate::ui::PlanLine::Compact(a, active) => {
+                    let compact = matches!(line, crate::ui::PlanLine::Compact(..));
+                    let ty = y + self.px(if compact { 3.0 } else { 6.0 });
+                    let mark = if *active { "●" } else { "○" };
+                    let mcol = if *active { t.accent } else { with_alpha(t.muted, 0.7) };
+                    let mw = self.label(q, mark, Font::Mono, 8.0, 700, 0.0, x, ty + self.px(1.0), mcol);
+                    let nx = x + mw + self.px(6.0);
+                    let name = match (&a.account, compact) {
+                        (Some(email), false) => email.clone(),
+                        _ => a.short(),
+                    };
+                    let ncol = if *active { t.fg } else { mix(t.fg, t.muted, 0.35) };
+                    // Compact: name, then each limit's percentage; full: the
+                    // email and how old the reading is.
+                    let tail = if a.account.is_none() {
+                        "NOT SIGNED IN".to_string()
+                    } else if a.is_stale {
+                        "WAITING".to_string()
+                    } else if compact {
+                        a.rows.iter().take(3).map(|r| {
+                            let (reset, v) = pct_text(r);
+                            if reset { format!("{} —", r.label.to_uppercase()) } else { format!("{} {}%", r.label.to_uppercase(), (v * 100.0).round() as i32) }
+                        }).collect::<Vec<_>>().join("  ")
+                    } else {
+                        let age = crate::usage::now_ms().saturating_sub(a.at_ms) / 60_000;
+                        match age {
+                            0..15 => String::new(),
+                            15..120 => format!("{age}M AGO"),
+                            120..2880 => format!("{}H AGO", age / 60),
+                            _ => format!("{}D AGO", age / 1440),
+                        }
+                    };
+                    let hot = compact && a.rows.iter().take(3).any(|r| { let (reset, v) = pct_text(r); !reset && (v > 0.9 || r.severity != "normal") });
+                    let tw = self.measure(&tail, Font::Mono, 9.0, 500, 0.6);
+                    self.label(q, &tail, Font::Mono, 9.0, 500, 0.6, right - tw, ty + self.px(1.0), if hot { t.alert } else { t.muted });
+                    let name = self.fit(&name, Font::Mono, 9.5, 600, (right - tw - self.px(10.0) - nx).max(0.0));
+                    self.label(q, &name, Font::Mono, 9.5, 600, 0.0, nx, ty, ncol);
+                }
+                crate::ui::PlanLine::Unsigned(names) => {
+                    let ty = y + self.px(3.0);
+                    let lw = self.label(q, "NOT SIGNED IN", Font::Mono, 9.0, 500, 0.6, x + self.px(12.0), ty + self.px(1.0), t.muted);
+                    let list = self.fit(&names.join(" "), Font::Mono, 9.5, 500, (right - x - self.px(24.0) - lw).max(0.0));
+                    self.label(q, &list, Font::Mono, 9.5, 500, 0.0, x + self.px(24.0) + lw, ty, mix(t.fg, t.muted, 0.5));
+                }
+                crate::ui::PlanLine::Bar(row) => {
+                    let by = y + self.px(3.0);
+                    let name = self.fit(&row.label.to_uppercase(), Font::Mono, 9.5, 600, self.px(40.0));
+                    self.label(q, &name, Font::Mono, 9.5, 600, 0.0, x + self.px(14.0), by, t.muted);
+                    // A window that has reset since this reading started over.
+                    let (reset, v) = pct_text(row);
+                    let left = crate::usage::until(row.resets_ms);
+                    let tail = if reset {
+                        "RESET".to_string()
+                    } else if left.is_empty() {
+                        format!("{:>3}%", row.pct.round() as i32)
+                    } else {
+                        format!("{:>3}% {left:>4}", row.pct.round() as i32)
+                    };
+                    let pw = self.measure(&tail, Font::Mono, 9.5, 500, 0.0);
+                    let col = if !reset && (row.severity != "normal" || v > 0.9) { t.alert } else { mix(t.fg, t.muted, 0.4) };
+                    self.label(q, &tail, Font::Mono, 9.5, 500, 0.0, right - pw, by, col);
+                    let mx = x + self.px(56.0);
+                    self.meter(q, mx, by + self.px(3.0), right - pw - self.px(10.0) - mx, v);
+                }
             }
-            if !stale.is_empty() {
-                let sw = self.measure(&stale, Font::Mono, 9.5, 500, 1.2);
-                let _ = hx;
-                self.label(q, &stale, Font::Mono, 9.5, 500, 1.2, right - sw, py + self.px(12.0), t.muted);
-            }
-            for (k, row) in u.rows.iter().enumerate() {
-                let y = py + self.px(32.0) + k as f32 * self.px(20.0);
-                let v = row.pct / 100.0;
-                let name = self.fit(&row.label.to_uppercase(), Font::Mono, 9.5, 600, self.px(40.0));
-                self.label(q, &name, Font::Mono, 9.5, 600, 0.0, x, y, t.muted);
-                // A window that has reset since this reading started over;
-                // its old percentage no longer means anything.
-                let reset = row.resets_ms != 0 && row.resets_ms <= crate::usage::now_ms();
-                let v = if reset { 0.0 } else { v };
-                let left = crate::usage::until(row.resets_ms);
-                let tail = if reset {
-                    "RESET".to_string()
-                } else if left.is_empty() {
-                    format!("{:>3}%", row.pct.round() as i32)
-                } else {
-                    format!("{:>3}% {left:>4}", row.pct.round() as i32)
-                };
-                let pw = self.measure(&tail, Font::Mono, 9.5, 500, 0.0);
-                let col = if row.severity != "normal" || v > 0.9 { t.alert } else { mix(t.fg, t.muted, 0.4) };
-                self.label(q, &tail, Font::Mono, 9.5, 500, 0.0, right - pw, y, col);
-                let mx = x + self.px(46.0);
-                self.meter(q, mx, y + self.px(3.0), right - pw - self.px(10.0) - mx, v);
-            }
+            y += lh;
         }
-        self.rect(q, Rect { x, y: fy, w: right - x, h: self.px(1.0).max(1.0) }, t.border, 0.0, NO_CLIP);
-        let (cpu, mem) = (self.sys.cpu, self.sys.mem);
-        for (k, (name, v)) in [("CPU", cpu), ("MEM", mem)].into_iter().enumerate() {
-            let y = fy + self.px(14.0) + k as f32 * self.px(20.0);
-            self.label(q, name, Font::Mono, 9.5, 600, 1.2, x, y, t.muted);
-            let pct = format!("{:>3}%", (v * 100.0).round() as i32);
-            let pw = self.measure(&pct, Font::Mono, 9.5, 500, 0.0);
-            self.label(q, &pct, Font::Mono, 9.5, 500, 0.0, right - pw, y, mix(t.fg, t.muted, 0.4));
-            let mx = x + self.px(46.0);
-            self.meter(q, mx, y + self.px(3.0), right - pw - self.px(10.0) - mx, v);
+
+        // LOAD: this machine; while the session on screen is on a remote
+        // host, that host's too, each under its name.
+        head(self, q, ly, "LOAD", self.load_collapsed);
+        let blocks = self.load_blocks();
+        let labelled = blocks.len() > 1;
+        let mx = x + self.px(46.0);
+        let mut y = ly + self.px(24.0);
+        for (label, lcol, load) in blocks {
+            let mut meters = vec![("CPU", load.cpu), ("MEM", load.mem)];
+            meters.extend(load.disk.map(|d| ("DISK", d)));
+            if self.load_collapsed {
+                let text = meters.iter().map(|(n, v)| format!("{n} {}%", (v * 100.0).round() as i32)).collect::<Vec<_>>().join("  ");
+                let tw = self.measure(&text, Font::Mono, 9.0, 500, 0.6);
+                let hot = meters.iter().any(|(_, v)| *v > 0.9);
+                self.label(q, &text, Font::Mono, 9.0, 500, 0.6, right - tw, y + self.px(2.0), if hot { t.alert } else { mix(t.fg, t.muted, 0.4) });
+                let l = self.fit(&label, Font::Mono, 9.0, 600, (right - tw - self.px(18.0) - x).max(0.0));
+                self.label(q, &l, Font::Mono, 9.0, 600, 1.2, x, y + self.px(2.0), lcol);
+                y += self.px(18.0);
+                continue;
+            }
+            if labelled {
+                let l = self.fit(&label, Font::Mono, 9.0, 600, right - x);
+                self.label(q, &l, Font::Mono, 9.0, 600, 1.2, x, y, lcol);
+                y += self.px(17.0);
+            }
+            for (name, v) in meters {
+                self.label(q, name, Font::Mono, 9.5, 600, 1.2, x, y, t.muted);
+                let pct = format!("{:>3}%", (v * 100.0).round() as i32);
+                let pw = self.measure(&pct, Font::Mono, 9.5, 500, 0.0);
+                self.label(q, &pct, Font::Mono, 9.5, 500, 0.0, right - pw, y, mix(t.fg, t.muted, 0.4));
+                self.meter(q, mx, y + self.px(3.0), right - pw - self.px(10.0) - mx, v);
+                y += self.px(19.0);
+            }
         }
         let ky = r.y + r.h - self.px(36.0);
         self.rect(q, Rect { x, y: ky - self.px(12.0), w: right - x, h: self.px(1.0).max(1.0) }, t.border, 0.0, NO_CLIP);
@@ -732,10 +903,11 @@ const KEYS_SESSIONS: &[(&str, &str)] = &[
     ("⌃⇧W", "Detach session (keeps running)"),
     ("⌃]  ⌃[", "Next / previous session"),
     ("⌃⇥  ⌃⇧⇥", "Next / previous session"),
-    ("⌃⇧1–9", "Jump to session"),
+    ("⌃⇧1–9  ⌃␣ 12", "Jump to session (number as shown)"),
     ("⌃⇧␣", "Next session that needs you"),
     ("⌃⇧D", "Session grid (dashboard)"),
     ("⌃⇧H", "Conversation timeline (right rail)"),
+    ("⌃⇧U", "Plan usage, every account"),
 ];
 
 const KEYS_VIEW: &[(&str, &str)] = &[
@@ -746,12 +918,25 @@ const KEYS_VIEW: &[(&str, &str)] = &[
     ("wheel  ⇧wheel", "Scroll · punkterm history"),
     ("Drag  ⌃⇧C", "Select · copy"),
     ("⌃click", "Open link"),
-    ("⌃⇧V  ⇧Ins", "Paste"),
+    ("⇧Ins  middle", "Paste clipboard · selection"),
     ("⌃?", "This help"),
+];
+
+const KEYS_PANES: &[(&str, &str)] = &[
+    ("⌃⇧V  ⌃⇧\"", "Split side by side · stacked"),
     ("⌃␣ v  ⌃␣ s", "Split side by side · stacked"),
-    ("⌃␣ hjkl", "Move between split panes"),
-    ("⌥ hjkl", "Move between split panes"),
+    ("⌃␣ hjkl  ⌥ hjkl", "Move between split panes"),
     ("⌃␣ z", "Zoom pane · ⌃␣ c n p"),
+    ("⌃click card", "Join that session beside this one"),
+    ("⌃␣ m  ⌃␣ J", "Mark pane · join it here"),
+    ("⌃␣ !", "Break pane out to its own window"),
+];
+
+const KEYS_GROUPS: &[(&str, &str)] = &[
+    ("⇧click card", "Pick sessions"),
+    ("⌃␣ g  ⌃␣ G", "Group picked · ungroup"),
+    ("⌃␣ ,", "Rename the group"),
+    ("click header", "Roll up: hidden from keys"),
 ];
 
 const LEGEND: &[(Status, &str)] = &[
@@ -921,6 +1106,286 @@ impl App {
         ease_out_cubic(*v)
     }
 
+    /// The resume menu: a host's recent Claude sessions, newest first, each
+    /// with its title (or first prompt), folder, branch, account, how long
+    /// ago, and your last prompt; ones a Claude has open are marked.
+    fn resume_layer(&mut self, q: &mut Vec<Quad>) {
+        let Some(m) = self.resume.as_ref() else { return };
+        let (host, sel, top) = (m.host, m.sel, m.top);
+        let items = m.items.clone();
+        let t = self.theme.clone();
+        let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+        self.rect(q, Rect { x: 0.0, y: 0.0, w, h }, with_alpha(t.bg, 0.72), 0.0, NO_CLIP);
+        let rows = self.resume_rows();
+        let row_h = self.px(48.0);
+        let pw = self.px(760.0).min(w - self.px(48.0));
+        let ph = self.px(110.0) + rows as f32 * row_h;
+        let r = Rect { x: ((w - pw) / 2.0).round(), y: ((h - ph) / 2.0).round(), w: pw, h: ph };
+        let c = self.px(18.0);
+        let cuts = [c, 0.0, c, 0.0];
+        q.push(Quad { rect: [r.x, r.y + self.px(10.0), r.w, r.h], uv: cuts, color: [0.0, 0.0, 0.0, 0.6], params: [kind::SHADOW, 0.0, 0.0, self.px(24.0)], clip: NO_CLIP, ..Default::default() });
+        self.shape(q, r, with_alpha(t.surface, 0.98), None, cuts);
+        q.push(Quad { rect: [r.x, r.y, r.w, r.h], uv: cuts, color: t.accent, color2: t.accent2, params: [kind::GRADIENT_STROKE, 0.0, self.px(1.0).max(1.0), 0.0], clip: NO_CLIP, ..Default::default() });
+        let x = r.x + self.px(28.0);
+        let right = r.x + r.w - self.px(28.0);
+        let y0 = r.y + self.px(24.0);
+        let hw = self.label(q, "RESUME", Font::Ui, 15.0, 800, 3.4, x, y0, t.accent);
+        let hname = self.hosts.get(host).map_or(String::new(), |h| h.name.to_uppercase());
+        self.meta(q, &[&hname, "RECENT CLAUDE SESSIONS"], x + hw + self.px(18.0), y0 + self.px(4.0), self.host_color(host));
+        let esc = "↑↓  ↵ RESUME  ·  ESC";
+        let ew = self.measure(esc, Font::Mono, 9.5, 600, 1.2);
+        self.label(q, esc, Font::Mono, 9.5, 600, 1.2, right - ew, y0 + self.px(4.0), t.muted);
+        let ly = r.y + self.px(84.0);
+        self.rect(q, Rect { x, y: ly - self.px(12.0), w: right - x, h: self.px(1.0).max(1.0) }, t.border, 0.0, NO_CLIP);
+        let list = match items {
+            None => {
+                self.label(q, "reading sessions…", Font::Mono, 11.0, 500, 0.0, x, ly, t.busy);
+                return;
+            }
+            Some(Err(e)) => {
+                self.label(q, &e, Font::Mono, 11.0, 500, 0.0, x, ly, t.alert);
+                return;
+            }
+            Some(Ok(v)) if v.is_empty() => {
+                self.label(q, "no Claude sessions on this host yet", Font::Mono, 11.0, 500, 0.0, x, ly, t.muted);
+                return;
+            }
+            Some(Ok(v)) => v,
+        };
+        // /home/<user>/x or /root/x as ~/x: the host's own home, whoever it is.
+        let home_dir = |p: &str| -> String {
+            if let Some(rest) = p.strip_prefix("/home/") {
+                return match rest.split_once('/') {
+                    Some((_, tail)) => format!("~/{tail}"),
+                    None => "~".into(),
+                };
+            }
+            p.strip_prefix("/root").map_or(p.to_string(), |t| format!("~{t}"))
+        };
+        for (k, s) in list.iter().enumerate().skip(top).take(rows) {
+            let ry = ly + (k - top) as f32 * row_h;
+            let rr = Rect { x: x - self.px(10.0), y: ry - self.px(6.0), w: right - x + self.px(20.0), h: row_h - self.px(4.0) };
+            if k == sel {
+                self.shape(q, rr, t.surface_alt, Some(with_alpha(t.accent2, 0.8)), [self.px(6.0), 0.0, 0.0, 0.0]);
+                self.rect(q, Rect { x: rr.x, y: rr.y + self.px(6.0), w: self.px(2.0), h: rr.h - self.px(12.0) }, t.accent2, 0.0, NO_CLIP);
+            }
+            // Right: how long ago, and OPEN when a Claude has it now.
+            let age = crate::usage::now_ms().saturating_sub(s.mtime) / 60_000;
+            let ago = match age {
+                0..2 => "NOW".to_string(),
+                2..120 => format!("{age}M AGO"),
+                120..2880 => format!("{}H AGO", age / 60),
+                _ => format!("{}D AGO", age / 1440),
+            };
+            let aw = self.measure(&ago, Font::Mono, 9.5, 500, 1.0);
+            self.label(q, &ago, Font::Mono, 9.5, 500, 1.0, right - aw, ry + self.px(1.0), t.muted);
+            let mut tail = aw + self.px(10.0);
+            if s.open {
+                tail += self.chip(q, "OPEN", t.busy, right - tail, ry + self.px(7.0), false) + self.px(8.0);
+            }
+            // Line one: its title, else its first prompt.
+            let title = if !s.title.is_empty() { s.title.clone() } else { s.first.clone() };
+            let title = self.fit(&title, Font::Ui, 13.0, 600, right - tail - x);
+            self.label(q, &title, Font::Ui, 13.0, 600, 0.0, x, ry - self.px(2.0), if k == sel { t.fg } else { mix(t.fg, t.muted, 0.2) });
+            // Line two: folder · branch · account · › your last prompt.
+            let mut meta = home_dir(&s.cwd);
+            if !s.branch.is_empty() && s.branch != "HEAD" {
+                meta.push_str(&format!(" · {}", s.branch));
+            }
+            if let Some(cfg) = s.config_name() {
+                meta.push_str(&format!(" · {cfg}"));
+            }
+            let meta = self.fit(&meta, Font::Mono, 10.0, 500, (right - x) * 0.45);
+            let mw = self.label(q, &meta, Font::Mono, 10.0, 500, 0.0, x, ry + self.px(19.0), t.accent2);
+            let last = if !s.last.is_empty() { &s.last } else { &s.first };
+            let last = self.fit(&format!("› {last}"), Font::Mono, 10.0, 400, (right - x - mw - self.px(14.0)).max(0.0));
+            self.label(q, &last, Font::Mono, 10.0, 400, 0.0, x + mw + self.px(14.0), ry + self.px(19.0), t.muted);
+        }
+        if list.len() > rows {
+            let more = format!("{}–{} OF {}", top + 1, (top + rows).min(list.len()), list.len());
+            let mw = self.measure(&more, Font::Mono, 9.0, 600, 1.0);
+            self.label(q, &more, Font::Mono, 9.0, 600, 1.0, right - mw, r.y + r.h - self.px(22.0), t.muted);
+        }
+    }
+
+    /// Usage overview: every Claude account on the hosts, each limit with its
+    /// meter, percentage and reset, and which hosts are signed in to it.
+    fn usage_layer(&mut self, q: &mut Vec<Quad>, dt: f32, animating: &mut bool) {
+        let mut ut = self.usage_t;
+        let e = Self::fade(&mut ut, self.usage_open, dt, 0.18, animating);
+        self.usage_t = ut;
+        if e <= 0.0 {
+            return;
+        }
+        let t = self.theme.clone();
+        let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+        self.rect(q, Rect { x: 0.0, y: 0.0, w, h }, with_alpha(t.bg, 0.72 * e), 0.0, NO_CLIP);
+        let accounts = self.usage_accounts();
+        // Accounts under their email's domain (they come sorted by it); on a
+        // wide enough window the domains share two columns, each going to
+        // the shorter one.
+        let mut groups: Vec<(String, Vec<crate::ui::AccountView>)> = Vec::new();
+        for v in accounts {
+            let domain = v.name.rsplit_once('@').map_or(String::from("other"), |(_, d)| d.to_lowercase());
+            match groups.last_mut().filter(|(d, _)| *d == domain) {
+                Some((_, list)) => list.push(v),
+                None => groups.push((domain, vec![v])),
+            }
+        }
+        let group_h = |g: &[crate::ui::AccountView]| -> f32 { self.px(30.0) + g.iter().map(|v| self.usage_account_h(v)).sum::<f32>() };
+        let two = groups.len() > 1 && w >= self.px(1240.0);
+        let mut cols: Vec<Vec<usize>> = vec![Vec::new(); if two { 2 } else { 1 }];
+        let mut col_h = vec![0.0f32; cols.len()];
+        for (k, (_, g)) in groups.iter().enumerate() {
+            let c = if col_h.len() > 1 && col_h[1] < col_h[0] { 1 } else { 0 };
+            cols[c].push(k);
+            col_h[c] += group_h(g);
+        }
+        let body = col_h.iter().cloned().fold(0.0, f32::max);
+        let pw = (if two { self.px(1180.0) } else { self.px(620.0) }).min(w - self.px(48.0));
+        let ph = (self.px(96.0) + body.max(self.px(60.0)) + self.px(36.0)).min(h - self.px(48.0));
+        let r = Rect { x: ((w - pw) / 2.0).round(), y: ((h - ph) / 2.0 + (1.0 - e) * self.px(14.0)).round(), w: pw, h: ph };
+        let c = self.px(18.0);
+        let cuts = [c, 0.0, c, 0.0];
+        q.push(Quad {
+            rect: [r.x, r.y + self.px(10.0), r.w, r.h],
+            uv: cuts,
+            color: [0.0, 0.0, 0.0, 0.6 * e],
+            params: [kind::SHADOW, 0.0, 0.0, self.px(24.0)],
+            clip: NO_CLIP,
+            ..Default::default()
+        });
+        self.shape(q, r, with_alpha(t.surface, 0.98 * e), None, cuts);
+        q.push(Quad {
+            rect: [r.x, r.y, r.w, r.h],
+            uv: cuts,
+            color: with_alpha(t.accent, e),
+            color2: with_alpha(t.accent2, e),
+            params: [kind::GRADIENT_STROKE, 0.0, self.px(1.0).max(1.0), 0.0],
+            clip: NO_CLIP,
+            ..Default::default()
+        });
+        let x = r.x + self.px(32.0);
+        let right = r.x + r.w - self.px(32.0);
+        let mut y = r.y + self.px(26.0);
+        let pw2 = self.label(q, "PLAN", Font::Ui, 15.0, 800, 3.4, x, y, with_alpha(t.accent, e));
+        self.meta(q, &["USAGE", "ALL ACCOUNTS"], x + pw2 + self.px(18.0), y + self.px(4.0), with_alpha(t.muted, e));
+        let esc = "ESC  CLOSE";
+        let ew = self.measure(esc, Font::Mono, 9.5, 600, 1.2);
+        self.label(q, esc, Font::Mono, 9.5, 600, 1.2, right - ew, y + self.px(4.0), with_alpha(t.muted, e));
+        y += self.px(36.0);
+        self.rect(q, Rect { x, y, w: right - x, h: self.px(1.0).max(1.0) }, with_alpha(t.border, e), 0.0, NO_CLIP);
+        y += self.px(22.0);
+        if groups.is_empty() {
+            let msg = "No usage yet: Claude Code records it while its sessions make requests.";
+            self.label(q, msg, Font::Ui, 12.0, 400, 0.0, x, y, with_alpha(t.muted, e));
+        }
+        let gap = self.px(40.0);
+        let col_w = (right - x - gap * (cols.len() as f32 - 1.0)) / cols.len() as f32;
+        let top = y;
+        for (ci, col) in cols.iter().enumerate() {
+            let cx = x + ci as f32 * (col_w + gap);
+            let mut y = top;
+            for &k in col {
+                let (domain, list) = &groups[k];
+                if y > r.y + r.h - self.px(40.0) {
+                    break;
+                }
+                // The domain as the group's header.
+                let dw = self.label(q, &domain.to_uppercase(), Font::Ui, 10.0, 700, 2.4, cx, y, with_alpha(t.accent2, e));
+                self.rect(q, Rect { x: cx + dw + self.px(10.0), y: y + self.px(6.0), w: (col_w - dw - self.px(10.0)).max(0.0), h: self.px(1.0).max(1.0) }, with_alpha(t.border, e), 0.0, NO_CLIP);
+                y += self.px(30.0);
+                for v in list {
+                    if y > r.y + r.h - self.px(40.0) {
+                        break;
+                    }
+                    y = self.usage_account(q, v, cx, cx + col_w, y, e);
+                }
+            }
+        }
+        let hint = "⌃⇧U  OR ALL › IN THE RAIL'S PLAN  ·  READ FROM EACH HOST'S CLAUDE CODE CACHE";
+        self.label(q, hint, Font::Mono, 9.0, 600, 1.0, x, r.y + r.h - self.px(24.0), with_alpha(t.muted, e));
+    }
+
+    /// One account's block in the usage overview, from `y` between `x` and
+    /// `right`: name, hosts, status, then each limit. Returns the next y.
+    fn usage_account(&mut self, q: &mut Vec<Quad>, v: &crate::ui::AccountView, x: f32, right: f32, mut y: f32, e: f32) -> f32 {
+        let t = self.theme.clone();
+        let row_h = self.px(24.0);
+        let head_h = self.px(46.0);
+        // The account, where it is signed in (or was), and how old its
+        // reading is.
+        let away = v.seen.is_some();
+        let ncol = if away { mix(t.fg, t.muted, 0.45) } else { t.fg };
+        let nw = self.label(q, &v.name, Font::Mono, 12.0, 700, 0.0, x, y, with_alpha(ncol, e));
+        let ago = |ms: u64| {
+            let m = crate::usage::now_ms().saturating_sub(ms) / 60_000;
+            match m {
+                0..2 => "NOW".to_string(),
+                2..120 => format!("{m}M AGO"),
+                120..2880 => format!("{}H AGO", m / 60),
+                _ => format!("{}D AGO", m / 1440),
+            }
+        };
+        let status = match (&v.seen, v.is_waiting, &v.reading) {
+            (Some((seen, _)), _, _) => format!("SIGNED OUT · SEEN {}", ago(*seen)),
+            (None, true, Some((at, _))) => format!("WAITING FOR CLAUDE · LAST READ {}", ago(*at)),
+            (None, true, None) => "WAITING FOR CLAUDE CODE TO READ IT".to_string(),
+            (None, false, Some((at, _))) => ago(*at),
+            (None, false, None) => String::new(),
+        };
+        let scol = if v.is_waiting { t.busy } else { t.muted };
+        let sw = self.measure(&status, Font::Mono, 9.5, 500, 1.2);
+        self.label(q, &status, Font::Mono, 9.5, 500, 1.2, right - sw, y + self.px(2.0), with_alpha(scol, e));
+        let mut hx = x + nw + self.px(14.0);
+        let names: Vec<(String, Rgba)> = match &v.seen {
+            Some((_, hosts)) => hosts.iter().map(|n| (n.to_uppercase(), t.muted)).collect(),
+            None => v.live.iter().map(|&h| (self.hosts[h].name.to_uppercase(), self.host_color(h))).collect(),
+        };
+        for (n, col) in names {
+            let n = self.fit(&n, Font::Mono, 9.0, 600, (right - sw - self.px(12.0) - hx).max(0.0));
+            if n.is_empty() {
+                break;
+            }
+            hx += self.label(q, &n, Font::Mono, 9.0, 600, 1.0, hx, y + self.px(3.0), with_alpha(col, e)) + self.px(10.0);
+        }
+        y += head_h - self.px(18.0);
+        let Some((_, rows)) = &v.reading else {
+            self.label(q, "no reading yet", Font::Mono, 10.0, 500, 0.0, x, y, with_alpha(t.muted, e));
+            y += row_h + self.px(18.0);
+            return y;
+        };
+        // An old reading's percentages fade; a window that has reset since
+        // says so rather than show what it was.
+        let dim = if away || v.is_waiting { 0.55 } else { 1.0 };
+        for row in rows {
+            let reset = row.resets_ms != 0 && row.resets_ms <= crate::usage::now_ms();
+            let val = if reset { 0.0 } else { row.pct / 100.0 };
+            let left = crate::usage::until(row.resets_ms);
+            let tail = if reset {
+                "RESET".to_string()
+            } else if left.is_empty() {
+                format!("{:>3}%", row.pct.round() as i32)
+            } else {
+                format!("{:>3}%  RESETS IN {left}", row.pct.round() as i32)
+            };
+            let name = self.fit(&row.label.to_uppercase(), Font::Mono, 10.0, 600, self.px(70.0));
+            self.label(q, &name, Font::Mono, 10.0, 600, 0.0, x, y, with_alpha(t.muted, e));
+            let tw = self.measure(&tail, Font::Mono, 10.0, 500, 0.0);
+            let col = if !reset && (row.severity != "normal" || val > 0.9) { t.alert } else { mix(t.fg, t.muted, 0.3) };
+            self.label(q, &tail, Font::Mono, 10.0, 500, 0.0, right - tw, y, with_alpha(col, e * dim));
+            let mx = x + self.px(84.0);
+            self.meter(q, mx, y + self.px(4.0), right - tw - self.px(16.0) - mx, val);
+            y += row_h;
+        }
+        y += self.px(18.0);
+        y
+    }
+
+    fn usage_account_h(&self, v: &crate::ui::AccountView) -> f32 {
+        self.px(46.0) + v.reading.as_ref().map_or(1, |(_, r)| r.len()) as f32 * self.px(24.0) + self.px(18.0)
+    }
+
     fn help_layer(&mut self, q: &mut Vec<Quad>, dt: f32, animating: &mut bool) {
         let mut ht = self.help_t;
         let e = Self::fade(&mut ht, self.help, dt, 0.18, animating);
@@ -932,8 +1397,10 @@ impl App {
         let (w, h) = (self.size.0 as f32, self.size.1 as f32);
         self.rect(q, Rect { x: 0.0, y: 0.0, w, h }, with_alpha(t.bg, 0.72 * e), 0.0, NO_CLIP);
 
-        let pw = self.px(760.0).min(w - self.px(48.0));
-        let ph = self.px(540.0).min(h - self.px(48.0));
+        let columns: [&[(&str, &[(&str, &str)])]; 2] = [&[("SESSIONS", KEYS_SESSIONS), ("GROUPS", KEYS_GROUPS)], &[("VIEW", KEYS_VIEW), ("PANES", KEYS_PANES)]];
+        let rows = columns.iter().map(|c| c.iter().map(|(_, k)| k.len()).sum::<usize>()).max().unwrap_or(0);
+        let pw = self.px(880.0).min(w - self.px(48.0));
+        let ph = (self.px(84.0) + self.px(62.0) + rows as f32 * self.px(23.0) + self.px(160.0)).min(h - self.px(48.0));
         let r = Rect { x: ((w - pw) / 2.0).round(), y: ((h - ph) / 2.0 + (1.0 - e) * self.px(14.0)).round(), w: pw, h: ph };
         let c = self.px(18.0);
         let cuts = [c, 0.0, c, 0.0];
@@ -970,16 +1437,22 @@ impl App {
         y += self.px(22.0);
 
         let col_w = (right - x - self.px(32.0)) / 2.0;
-        let key_w = self.px(112.0);
-        for (ci, (title, keys)) in [("SESSIONS", KEYS_SESSIONS), ("VIEW", KEYS_VIEW)].into_iter().enumerate() {
+        let key_w = self.px(136.0);
+        for (ci, sections) in columns.into_iter().enumerate() {
             let cx = x + ci as f32 * (col_w + self.px(32.0));
             let mut cy = y;
-            self.meta(q, &[title], cx, cy, with_alpha(t.accent2, e));
-            cy += self.px(24.0);
-            for (k, v) in keys {
-                self.label(q, k, Font::Mono, 12.0, 700, 0.0, cx, cy, with_alpha(t.fg, e));
-                self.label(q, v, Font::Ui, 12.0, 400, 0.0, cx + key_w, cy, with_alpha(mix(t.fg, t.muted, 0.35), e));
-                cy += self.px(23.0);
+            for (si, (title, keys)) in sections.iter().enumerate() {
+                if si > 0 {
+                    cy += self.px(14.0);
+                }
+                self.meta(q, &[title], cx, cy, with_alpha(t.accent2, e));
+                cy += self.px(24.0);
+                for (k, v) in keys.iter() {
+                    self.label(q, k, Font::Mono, 12.0, 700, 0.0, cx, cy, with_alpha(t.fg, e));
+                    let v = self.fit(v, Font::Ui, 12.0, 400, col_w - key_w);
+                    self.label(q, &v, Font::Ui, 12.0, 400, 0.0, cx + key_w, cy, with_alpha(mix(t.fg, t.muted, 0.35), e));
+                    cy += self.px(23.0);
+                }
             }
         }
 
@@ -1010,7 +1483,7 @@ impl App {
         let e = Self::fade(&mut pt, self.prompt.is_some(), dt, 0.16, animating);
         self.prompt_t = pt;
         let Some(p) = self.prompt.as_ref() else { return };
-        let (text, sel) = (p.text.clone(), p.sel);
+        let (text, sel, group) = (p.text.clone(), p.sel, p.group);
         let matches: Vec<String> = p.matches().into_iter().map(str::to_string).collect();
         let t = self.theme.clone();
         let (w, h) = (self.size.0 as f32, self.size.1 as f32);
@@ -1044,7 +1517,12 @@ impl App {
         let x = r.x + self.px(28.0);
         let right = r.x + r.w - self.px(28.0);
         let mut y = r.y + self.px(24.0);
-        self.meta(q, &["CONNECT", "JOIN TMUX ON A HOST"], x, y, with_alpha(t.accent2, e));
+        let naming = group.is_some();
+        if naming {
+            self.meta(q, &["GROUP", "NAME IT"], x, y, with_alpha(t.accent2, e));
+        } else {
+            self.meta(q, &["CONNECT", "JOIN TMUX ON A HOST"], x, y, with_alpha(t.accent2, e));
+        }
         let esc = "ESC  CANCEL";
         let ew = self.measure(esc, Font::Mono, 9.5, 600, 1.2);
         self.label(q, esc, Font::Mono, 9.5, 600, 1.2, right - ew, y, with_alpha(t.muted, e));
@@ -1055,15 +1533,24 @@ impl App {
         self.shape(q, ib, with_alpha(t.surface_alt, e), Some(with_alpha(if sel.is_none() { t.accent } else { t.border }, e)), [self.px(8.0), 0.0, 0.0, 0.0]);
         let gx = ib.x + self.px(14.0);
         let gy = ib.y + self.px(12.0);
-        let gw = self.label(q, "ssh", Font::Mono, 13.0, 700, 0.0, gx, gy, with_alpha(t.accent, e));
+        let gw = self.label(q, if naming { "name" } else { "ssh" }, Font::Mono, 13.0, 700, 0.0, gx, gy, with_alpha(t.accent, e));
         let tx = gx + gw + self.px(10.0);
-        let shown = if text.is_empty() { "ubuntu@203.0.113.7  or  -i ~/.ssh/key.pem ubuntu@host".to_string() } else { text.clone() };
+        let placeholder = match group.and_then(|g| self.groups.get(g)) {
+            Some(g) => format!("{}  (↵ keeps it)", g.name),
+            None => "ubuntu@203.0.113.7  or  -i ~/.ssh/key.pem ubuntu@host".to_string(),
+        };
+        let shown = if text.is_empty() { placeholder } else { text.clone() };
         let shown = self.fit(&shown, Font::Mono, 13.0, 500, ib.x + ib.w - tx - self.px(20.0));
         let tw = self.label(q, &shown, Font::Mono, 13.0, 500, 0.0, tx, gy, with_alpha(if text.is_empty() { t.muted } else { t.fg }, e));
         let cx = if text.is_empty() { tx } else { tx + tw + self.px(2.0) };
         self.rect(q, Rect { x: cx, y: ib.y + self.px(10.0), w: self.px(8.0), h: self.px(20.0) }, with_alpha(t.cursor, 0.85 * e), 0.0, NO_CLIP);
         y += ib.h + self.px(18.0);
 
+        if naming {
+            let hint = "↵ SAVE  ·  ROLL IT UP: CLICK ITS HEADER";
+            self.label(q, hint, Font::Mono, 9.0, 600, 1.0, x, r.y + r.h - self.px(24.0), with_alpha(t.muted, e));
+            return;
+        }
         // Suggestions.
         self.meta(q, &["RECENT", "FROM SHELL HISTORY"], x, y, with_alpha(t.muted, e));
         y += self.px(18.0);
@@ -1087,6 +1574,42 @@ impl App {
         }
         let hint = "↑↓ PICK  ·  TAB FILL  ·  ↵ CONNECT  ·  KEY-BASED SSH ONLY";
         self.label(q, hint, Font::Mono, 9.0, 600, 1.0, x, r.y + r.h - self.px(24.0), with_alpha(t.muted, e));
+    }
+
+    /// The right-click menu: a title, then its rows, the hovered one lit.
+    fn menu_layer(&mut self, q: &mut Vec<Quad>) {
+        let Some(m) = self.menu.as_ref() else { return };
+        let (r, rows) = m.rects(self.scale, (self.size.0 as f32, self.size.1 as f32));
+        let title = m.title.to_uppercase();
+        let items: Vec<(String, bool)> = m.items.iter().map(|i| (i.label.clone(), i.act.is_some())).collect();
+        let hover = m.hover;
+        let t = self.theme.clone();
+        let cut = self.px(8.0);
+        q.push(Quad {
+            rect: [r.x, r.y + self.px(6.0), r.w, r.h],
+            uv: [cut, 0.0, cut, 0.0],
+            color: [0.0, 0.0, 0.0, 0.5],
+            params: [kind::SHADOW, 0.0, 0.0, self.px(14.0)],
+            clip: NO_CLIP,
+            ..Default::default()
+        });
+        self.shape(q, r, with_alpha(t.surface, 0.98), Some(t.border), [cut, 0.0, cut, 0.0]);
+        let x = r.x + self.px(14.0);
+        let title = self.fit(&title, Font::Ui, 10.0, 700, r.w - self.px(28.0));
+        self.label(q, &title, Font::Ui, 10.0, 700, 2.0, x, r.y + self.px(10.0), t.accent);
+        for (k, (rr, (label, act))) in rows.iter().zip(items).enumerate() {
+            if !act {
+                self.rect(q, Rect { x: rr.x + self.px(8.0), y: rr.y + rr.h / 2.0, w: rr.w - self.px(16.0), h: self.px(1.0).max(1.0) }, t.border, 0.0, NO_CLIP);
+                continue;
+            }
+            let on = hover == Some(k);
+            if on {
+                self.shape(q, *rr, t.surface_alt, None, [self.px(5.0), 0.0, 0.0, 0.0]);
+                self.rect(q, Rect { x: rr.x, y: rr.y + self.px(5.0), w: self.px(2.0), h: rr.h - self.px(10.0) }, t.accent, 0.0, NO_CLIP);
+            }
+            let label = self.fit(&label, Font::Ui, 12.0, 500, rr.w - self.px(20.0));
+            self.label(q, &label, Font::Ui, 12.0, 500, 0.0, rr.x + self.px(10.0), rr.y + self.px(6.0), if on { t.fg } else { mix(t.fg, t.muted, 0.25) });
+        }
     }
 
     fn toast_layer(&mut self, q: &mut Vec<Quad>, l: &Layout, animating: &mut bool) {

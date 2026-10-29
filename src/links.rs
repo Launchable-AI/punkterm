@@ -1,5 +1,6 @@
-//! Links in the terminal: OSC 8 hyperlinks, else URLs in the text (joined
-//! across soft-wrapped rows). Ctrl+click opens them.
+//! Links in the terminal: OSC 8 hyperlinks, else URLs or file paths in the
+//! text (joined across soft-wrapped rows). Ctrl+click opens them; a path on
+//! an ssh host is downloaded first (`App::open_link`).
 
 use std::process::{Command, Stdio};
 
@@ -10,6 +11,9 @@ use alacritty_terminal::term::Term;
 
 pub struct Link {
     pub uri: String,
+    /// A file path (absolute or `~/`), not a URL: it lives where the pane's
+    /// program runs.
+    pub is_path: bool,
     /// Every cell the link covers, for the hover underline.
     pub cells: Vec<Point>,
 }
@@ -21,23 +25,45 @@ pub fn at<T>(term: &Term<T>, point: Point) -> Option<Link> {
     let top = -(grid.history_size() as i32);
     let bottom = term.screen_lines() as i32 - 1;
 
-    // An explicit hyperlink: the run of cells on this row that share it.
+    // An explicit hyperlink: the run of cells that share it, followed onto
+    // the rows above and below where it runs on from a row's end to the
+    // next one's start (a long URL Claude Code broke at the pane's width).
     if let Some(h) = grid[point].hyperlink() {
-        let row = &grid[point.line];
-        let same = |c: usize| row[Column(c)].hyperlink().is_some_and(|o| o == h);
+        let same = |l: i32, c: usize| grid[Line(l)][Column(c)].hyperlink().is_some_and(|o| o == h);
         let (mut a, mut b) = (point.column.0, point.column.0);
-        while a > 0 && same(a - 1) {
+        while a > 0 && same(point.line.0, a - 1) {
             a -= 1;
         }
-        while b + 1 < cols && same(b + 1) {
+        while b + 1 < cols && same(point.line.0, b + 1) {
             b += 1;
         }
-        let cells = (a..=b).map(|c| Point::new(point.line, Column(c))).collect();
-        return allowed(h.uri()).then(|| Link { uri: h.uri().to_string(), cells });
+        let mut cells: Vec<Point> = (a..=b).map(|c| Point::new(point.line, Column(c))).collect();
+        // Up: while this run starts its row and the row above ends in it.
+        let (mut l, mut start) = (point.line.0, a);
+        while start == 0 && l > top && same(l - 1, cols - 1) {
+            l -= 1;
+            start = (0..cols).rev().take_while(|&c| same(l, c)).last().unwrap_or(cols - 1);
+            cells.splice(0..0, (start..cols).map(|c| Point::new(Line(l), Column(c))));
+        }
+        // Down: while this run ends its row and the row below starts in it.
+        let (mut l, mut end) = (point.line.0, b);
+        while end == cols - 1 && l < bottom && same(l + 1, 0) {
+            l += 1;
+            end = (0..cols).take_while(|&c| same(l, c)).last().unwrap_or(0);
+            cells.extend((0..=end).map(|c| Point::new(Line(l), Column(c))));
+        }
+        return allowed(h.uri()).then(|| Link { uri: h.uri().to_string(), is_path: false, cells });
     }
 
-    // Plain text: the logical line through `point`, rows joined where they wrap.
-    let wraps = |l: i32| grid[Line(l)][Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+    // Plain text: the logical line through `point`, rows joined where they
+    // wrap: where the terminal wrapped them, or where a program broke a long
+    // line itself (Claude Code does, at the pane's width): a row that runs
+    // to its last column into one that starts at its first.
+    let ink = |l: i32, c: usize| !grid[Line(l)][Column(c)].c.is_whitespace();
+    let wraps = |l: i32| {
+        let last = &grid[Line(l)][Column(cols - 1)];
+        last.flags.contains(Flags::WRAPLINE) || (l < bottom && ink(l, cols - 1) && ink(l + 1, 0))
+    };
     let mut first = point.line.0;
     while first > top && wraps(first - 1) {
         first -= 1;
@@ -62,9 +88,51 @@ pub fn at<T>(term: &Term<T>, point: Point) -> Option<Link> {
             at.push(Point::new(Line(l), Column(c)));
         }
     }
-    let (a, b) = find_url(&text, click?)?;
+    let click = click?;
+    if let Some((a, b)) = find_url(&text, click) {
+        let uri: String = text[a..b].iter().collect();
+        return Some(Link { uri, is_path: false, cells: at[a..b].to_vec() });
+    }
+    let (a, b) = find_path(&text, click)?;
     let uri: String = text[a..b].iter().collect();
-    Some(Link { uri, cells: at[a..b].to_vec() })
+    Some(Link { uri, is_path: true, cells: at[a..b].to_vec() })
+}
+
+/// The file path (`/…` or `~/…`) in `text` covering index `i`, as a char
+/// range: the token around it, less a trailing `:line:col` and punctuation.
+fn find_path(text: &[char], i: usize) -> Option<(usize, usize)> {
+    let stop = |c: char| c.is_whitespace() || "<>\"'`|(){}[]".contains(c) || (c as u32) < 0x20;
+    if stop(*text.get(i)?) {
+        return None;
+    }
+    let mut a = i;
+    while a > 0 && !stop(text[a - 1]) {
+        a -= 1;
+    }
+    let mut b = i;
+    while b < text.len() && !stop(text[b]) {
+        b += 1;
+    }
+    // Where the path starts inside the token ("file=/x", "→/x"): its slash.
+    let start = (a..b).find(|&k| text[k] == '/' || (text[k] == '~' && text.get(k + 1) == Some(&'/')))?;
+    if start > a && !"=:→".contains(text[start - 1]) {
+        return None;
+    }
+    let a = start;
+    // file.rs:12:5 opens file.rs; a sentence's full stop is not the path's.
+    loop {
+        let tail: String = text[a..b].iter().collect();
+        if let Some(k) = tail.rfind(':').filter(|&k| k + 1 < tail.len() && tail[k + 1..].chars().all(|c| c.is_ascii_digit())) {
+            b = a + tail[..k].chars().count();
+        } else if text[a..b].last().is_some_and(|c| ".,;:!?".contains(*c)) {
+            b -= 1;
+        } else {
+            break;
+        }
+    }
+    let path: String = text[a..b].iter().collect();
+    let body = path.trim_start_matches('~');
+    (i >= a && i < b && body.len() > 1 && body[1..].chars().any(|c| c.is_alphanumeric())).then_some((a, b))
 }
 
 /// Schemes worth handing to the desktop. An OSC 8 link can name anything.
@@ -114,6 +182,22 @@ mod tests {
         let chars: Vec<char> = s.chars().collect();
         let i = s[..s.find(at).unwrap()].chars().count();
         find_url(&chars, i).map(|(a, b)| chars[a..b].iter().collect())
+    }
+
+    fn path(s: &str, at: &str) -> Option<String> {
+        let chars: Vec<char> = s.chars().collect();
+        let i = s[..s.find(at).unwrap()].chars().count();
+        find_path(&chars, i).map(|(a, b)| chars[a..b].iter().collect())
+    }
+
+    #[test]
+    fn finds_paths() {
+        assert_eq!(path("The file is at /tmp/x/shot.png.", "shot").as_deref(), Some("/tmp/x/shot.png"));
+        assert_eq!(path("see src=/home/me/a.rs:12:5 now", "a.rs").as_deref(), Some("/home/me/a.rs"));
+        assert_eq!(path("open ~/Downloads/report.pdf", "report").as_deref(), Some("~/Downloads/report.pdf"));
+        assert_eq!(path("(/var/log/syslog)", "syslog").as_deref(), Some("/var/log/syslog"));
+        assert_eq!(path("and/or this", "or"), None);
+        assert_eq!(path("a / b", "/"), None);
     }
 
     #[test]

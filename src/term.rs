@@ -81,8 +81,15 @@ pub struct Pane {
     pub tmux_pane: Option<String>,
     /// Output is dropped until the history capture lands (it already contains it).
     pub awaiting_capture: bool,
+    /// Inline images this pane's program sent (kitty graphics protocol).
+    pub graphics: crate::graphics::Graphics,
+    /// When to re-read the pane from tmux after a resize: tmux reflows its
+    /// copy of the screen and history, and ours would not match it.
+    pub resync_at: Option<std::time::Instant>,
     pub tmux_cursor: (usize, usize),
     pub tmux_alt: bool,
+    /// Mode sequences to replay after a capture (tmux's record of them).
+    pub tmux_modes: String,
     /// The tmux window this pane is in, where in it (cells), and whether
     /// that window is zoomed onto one pane.
     pub window: Option<String>,
@@ -139,8 +146,11 @@ impl Pane {
             conn: None,
             tmux_pane: None,
             awaiting_capture: false,
+            graphics: Default::default(),
+            resync_at: None,
             tmux_cursor: (0, 0),
             tmux_alt: false,
+            tmux_modes: String::new(),
             window: None,
             pos: (0, 0),
             zoomed: false,
@@ -174,8 +184,11 @@ impl Pane {
             conn: Some(conn),
             tmux_pane: Some(pane.to_string()),
             awaiting_capture: true,
+            graphics: Default::default(),
+            resync_at: None,
             tmux_cursor: (0, 0),
             tmux_alt: false,
+            tmux_modes: String::new(),
             window: None,
             pos: (0, 0),
             zoomed: false,
@@ -192,10 +205,15 @@ impl Pane {
         matches!(self.backend, Backend::Tmux { .. })
     }
 
-    /// Feed bytes from tmux into the terminal state.
+    /// Feed bytes from tmux into the terminal state, images taken out
+    /// (and their replies sent back to the program).
     pub fn feed(&mut self, bytes: &[u8]) {
+        let (bytes, replies) = self.graphics.filter(bytes);
         if let Backend::Tmux { parser, .. } = &mut self.backend {
-            parser.advance(&mut *self.term.lock(), bytes);
+            parser.advance(&mut *self.term.lock(), &bytes);
+        }
+        if !replies.is_empty() {
+            self.write(replies);
         }
     }
 
@@ -232,6 +250,10 @@ impl Pane {
         if size != self.size {
             self.size = size;
             self.term.lock().resize(size);
+            // Once the size settles (a window drag resizes many times).
+            if !self.awaiting_capture {
+                self.resync_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
+            }
         }
     }
 }

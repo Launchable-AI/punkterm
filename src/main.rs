@@ -3,6 +3,8 @@ mod claude;
 mod clipboard;
 mod gfx;
 mod glyphs;
+mod resume;
+mod graphics;
 mod hosts;
 mod input;
 mod links;
@@ -121,13 +123,9 @@ fn hover_link(app: &mut App, gpu: &Gpu, mouse: (f64, f64), mods: ModifiersState)
 
 /// Paste text into the active session, bracketed when the program asked.
 fn paste_into(app: &mut App, text: Option<String>) {
-    let (Some(t), Some(p)) = (text, app.active_pane()) else { return };
-    let bracketed = p.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
-    let body = t.replace("\r\n", "\r").replace('\n', "\r");
-    if bracketed {
-        p.write(format!("\x1b[200~{}\x1b[201~", body.replace('\x1b', "")).into_bytes());
-    } else {
-        p.write(body.into_bytes());
+    if let Some(t) = text {
+        let i = app.active;
+        app.paste_text(i, &t);
     }
 }
 
@@ -291,6 +289,17 @@ impl ApplicationHandler for Win {
                     _ => None,
                 };
                 // Overlays take the keyboard while they are open.
+                if app.menu.is_some() {
+                    match code {
+                        Some(KeyCode::ArrowDown) => app.menu_step(1),
+                        Some(KeyCode::ArrowUp) => app.menu_step(-1),
+                        Some(KeyCode::Enter | KeyCode::NumpadEnter) => app.menu_enter(),
+                        Some(KeyCode::ShiftLeft | KeyCode::ShiftRight | KeyCode::ControlLeft | KeyCode::ControlRight) => {}
+                        _ => app.menu = None,
+                    }
+                    gpu.window.request_redraw();
+                    return;
+                }
                 if app.prompt.is_some() {
                     use ui::PromptKey as K;
                     let k = match code {
@@ -317,6 +326,26 @@ impl ApplicationHandler for Win {
                     gpu.window.request_redraw();
                     return;
                 }
+                if app.resume.is_some() {
+                    match code {
+                        Some(KeyCode::ArrowDown | KeyCode::KeyJ) => app.resume_step(1),
+                        Some(KeyCode::ArrowUp | KeyCode::KeyK) => app.resume_step(-1),
+                        Some(KeyCode::PageDown) => app.resume_step(8),
+                        Some(KeyCode::PageUp) => app.resume_step(-8),
+                        Some(KeyCode::Enter | KeyCode::NumpadEnter) => app.resume_pick(),
+                        Some(KeyCode::Escape | KeyCode::KeyQ) => app.resume = None,
+                        _ => {}
+                    }
+                    gpu.window.request_redraw();
+                    return;
+                }
+                if app.usage_open {
+                    if matches!(code, Some(KeyCode::Escape | KeyCode::KeyU | KeyCode::Enter | KeyCode::KeyQ)) {
+                        app.toggle_usage();
+                    }
+                    gpu.window.request_redraw();
+                    return;
+                }
                 if app.overview && !(m.control_key() && m.shift_key() && code != Some(KeyCode::KeyD)) {
                     match code {
                         Some(KeyCode::Escape) | Some(KeyCode::KeyD) if code == Some(KeyCode::Escape) || (m.control_key() && m.shift_key()) => {
@@ -332,6 +361,21 @@ impl ApplicationHandler for Win {
                     gpu.window.request_redraw();
                     return;
                 }
+                // The second digit of a session number begun with the leader.
+                if let Some((d, t)) = app.digits.take().filter(|(_, t)| t.elapsed().as_millis() < 1000) {
+                    let digit = match &event.logical_key {
+                        Key::Character(s) => s.chars().next().and_then(|c| c.to_digit(10)),
+                        _ => None,
+                    };
+                    if let Some(e) = digit.filter(|_| !m.control_key() && !m.alt_key()) {
+                        app.select_nth(d * 10 + e as usize);
+                        gpu.window.request_redraw();
+                        return;
+                    }
+                    if matches!(code, Some(KeyCode::ShiftLeft | KeyCode::ShiftRight)) {
+                        app.digits = Some((d, t));
+                    }
+                }
                 // tmux-style leader: Ctrl+Space, then a key within 3 s.
                 if let Some(t) = app.leader.take().filter(|t| t.elapsed().as_secs() < 3) {
                     if matches!(code, Some(KeyCode::ShiftLeft | KeyCode::ShiftRight | KeyCode::ControlLeft | KeyCode::ControlRight | KeyCode::AltLeft | KeyCode::AltRight)) {
@@ -346,6 +390,19 @@ impl ApplicationHandler for Win {
                         (Some('v' | '%'), _) => app.split(true),
                         (Some('s' | '"'), _) => app.split(false),
                         (Some('z'), _) => app.toggle_zoom(),
+                        (Some('m'), _) => app.mark(),
+                        (Some('g'), _) => app.group_picked(),
+                        (Some('G'), _) => app.ungroup_picked(),
+                        (Some(','), _) => app.rename_group(None),
+                        // Session by number; a second digit within a second
+                        // makes it two-digit (⌃␣ 1 2 is session 12).
+                        (Some(d @ '1'..='9'), _) => {
+                            let d = d as usize - '0' as usize;
+                            app.select_nth(d);
+                            app.digits = Some((d, std::time::Instant::now()));
+                        }
+                        (Some('J'), _) => app.join_marked(),
+                        (Some('!'), _) => app.break_out(),
                         (Some('c'), _) => app.new_session(app.active_host()),
                         (Some('n'), _) => app.cycle(1),
                         (Some('p'), _) => app.cycle(-1),
@@ -400,8 +457,14 @@ impl ApplicationHandler for Win {
                     gpu.window.request_redraw();
                     return;
                 }
+                // Shift+Insert pastes the clipboard (Ctrl+Shift+V splits);
+                // middle-click pastes the primary selection.
                 if m.shift_key() && !m.control_key() && !m.alt_key() && code == Some(KeyCode::Insert) {
-                    paste_into(app, clipboard::paste_primary());
+                    // An image (no text): pasted as a file path, as with Ctrl+V.
+                    let text = clipboard::paste().filter(|t| !t.is_empty());
+                    if text.is_some() || !app.paste_image() {
+                        paste_into(app, text);
+                    }
                     gpu.window.request_redraw();
                     return;
                 }
@@ -462,6 +525,10 @@ impl ApplicationHandler for Win {
                             app.toggle_timeline();
                             true
                         }
+                        Some(KeyCode::KeyU) => {
+                            app.toggle_usage();
+                            true
+                        }
                         Some(KeyCode::KeyW) => {
                             app.close_active();
                             true
@@ -473,13 +540,18 @@ impl ApplicationHandler for Win {
                             }
                             true
                         }
+                        // Splits, as the leader's v and ": side by side, stacked.
                         Some(KeyCode::KeyV) => {
-                            paste_into(app, clipboard::paste());
+                            app.split(true);
+                            true
+                        }
+                        Some(KeyCode::Quote) => {
+                            app.split(false);
                             true
                         }
                         Some(c @ (KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3 | KeyCode::Digit4 | KeyCode::Digit5
                         | KeyCode::Digit6 | KeyCode::Digit7 | KeyCode::Digit8 | KeyCode::Digit9)) => {
-                            app.select(c as usize - KeyCode::Digit1 as usize);
+                            app.select_nth(c as usize - KeyCode::Digit1 as usize + 1);
                             true
                         }
                         Some(KeyCode::Tab) => {
@@ -502,6 +574,12 @@ impl ApplicationHandler for Win {
                     gpu.window.request_redraw();
                     return;
                 }
+                // Ctrl+V in Claude on a remote host: Claude would read that
+                // host's clipboard, so bring this one's image over instead.
+                if m.control_key() && !m.shift_key() && !m.alt_key() && code == Some(KeyCode::KeyV) && app.remote_claude() && app.paste_image() {
+                    gpu.window.request_redraw();
+                    return;
+                }
                 let mut typed = false;
                 if let Some(p) = app.active_pane() {
                     let mode = *p.term.lock().mode();
@@ -518,6 +596,36 @@ impl ApplicationHandler for Win {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse = (position.x, position.y);
+                if app.menu.is_some() {
+                    if app.menu_hover(position.x as f32, position.y as f32) {
+                        gpu.window.request_redraw();
+                    }
+                    return;
+                }
+                if app.divider_drag(position.x as f32, position.y as f32) {
+                    gpu.window.request_redraw();
+                    return;
+                }
+                // Over a split divider: a resize pointer.
+                let over = app.divider_at(position.x as f32, position.y as f32).map(|(_, v)| v);
+                if over != app.divider_hover {
+                    app.divider_hover = over;
+                    gpu.window.set_cursor(match over {
+                        Some(true) => CursorIcon::ColResize,
+                        Some(false) => CursorIcon::RowResize,
+                        None => CursorIcon::Default,
+                    });
+                }
+                if app.card_drag_to(position.x as f32, position.y as f32) {
+                    gpu.window.set_cursor(CursorIcon::Grabbing);
+                    gpu.window.request_redraw();
+                    return;
+                }
+                app.pointer = (position.x as f32, position.y as f32);
+                // A program that takes the mouse gets the motion it asked for.
+                if app.mouse_report_motion(position.x as f32, position.y as f32) {
+                    return;
+                }
                 if app.mouse_drag(position.x as f32, position.y as f32) {
                     gpu.window.request_redraw();
                 }
@@ -528,16 +636,55 @@ impl ApplicationHandler for Win {
                     gpu.window.request_redraw();
                 }
             }
-            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => app.mouse_up(),
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                if app.divider_release() {
+                    gpu.window.request_redraw();
+                }
+                if app.card_drop(self.mouse.0 as f32, self.mouse.1 as f32) {
+                    gpu.window.set_cursor(CursorIcon::Default);
+                    gpu.window.request_redraw();
+                }
+                app.mouse_report(self.mouse.0 as f32, self.mouse.1 as f32, 0, false);
+                app.mouse_up();
+            }
+            WindowEvent::MouseInput { state, button: button @ (MouseButton::Middle | MouseButton::Right), .. }
+                if state == ElementState::Released =>
+            {
+                let b = if button == MouseButton::Middle { 1 } else { 2 };
+                app.mouse_report(self.mouse.0 as f32, self.mouse.1 as f32, b, false);
+            }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Middle, .. } => {
-                if !app.help && !app.overview && app.card_at(self.mouse.0 as f32, self.mouse.1 as f32).is_none() {
+                let (mx, my) = (self.mouse.0 as f32, self.mouse.1 as f32);
+                if app.help || app.overview || app.card_at(mx, my).is_some() {
+                } else if !self.mods.shift_key() && app.mouse_report(mx, my, 1, true) {
+                } else {
                     paste_into(app, clipboard::paste_primary());
                 }
             }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                let (mx, my) = (self.mouse.0 as f32, self.mouse.1 as f32);
+                app.menu = None;
+                if !app.help && !app.overview && app.prompt.is_none() && !app.open_menu(mx, my) && !self.mods.shift_key() {
+                    app.mouse_report(mx, my, 2, true);
+                }
+                app.menu_hover(mx, my);
+                gpu.window.request_redraw();
+            }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 let (mx, my) = (self.mouse.0 as f32, self.mouse.1 as f32);
-                if app.help {
+                if app.menu.is_some() {
+                    app.menu_click(mx, my);
+                    gpu.window.request_redraw();
+                } else if app.help {
                     app.toggle_help();
+                    gpu.window.request_redraw();
+                } else if app.resume.is_some() {
+                    app.resume_click(mx, my);
+                    gpu.window.request_redraw();
+                } else if app.usage_open {
+                    app.toggle_usage();
+                    gpu.window.request_redraw();
+                } else if app.footer_click(mx, my) {
                     gpu.window.request_redraw();
                 } else if app.overview {
                     if let Some(i) = app.overview_tile_at(mx, my) {
@@ -552,13 +699,32 @@ impl ApplicationHandler for Win {
                     } else if app.timeline_click(mx, my) {
                         gpu.window.request_redraw();
                     }
+                } else if let Some(h) = app.resume_at(mx, my) {
+                    app.open_resume(h);
+                    gpu.window.request_redraw();
                 } else if let Some(h) = app.add_at(mx, my) {
                     app.new_session(h);
                     gpu.window.request_redraw();
+                } else if app.head_click(mx, my) {
+                    gpu.window.request_redraw();
                 } else if let Some(i) = app.card_at(mx, my) {
-                    app.select(i);
+                    // Shift+click picks sessions to group; Ctrl+click brings
+                    // that session beside this one (tmux's join-pane).
+                    if self.mods.shift_key() {
+                        app.pick(i);
+                    } else if self.mods.control_key() && i != app.active {
+                        app.join(i);
+                    } else {
+                        app.picked.clear();
+                        app.select(i);
+                        app.card_press(i, mx, my);
+                    }
                     gpu.window.request_redraw();
                 } else if self.mods.control_key() && app.open_link(mx, my) {
+                } else if app.divider_press(mx, my) {
+                    gpu.window.request_redraw();
+                } else if !self.mods.shift_key() && app.mouse_report(mx, my, 0, true) {
+                    // The program takes the click (Shift+click still selects).
                 } else if app.mouse_down(mx, my) {
                     gpu.window.request_redraw();
                 }
@@ -568,7 +734,11 @@ impl ApplicationHandler for Win {
                     MouseScrollDelta::LineDelta(_, y) => y * 3.0,
                     MouseScrollDelta::PixelDelta(PhysicalPosition { y, .. }) => y as f32 / app.glyphs.cell_h,
                 };
-                if app.timeline_open && app.timeline_at(self.mouse.0 as f32, self.mouse.1 as f32) {
+                if app.resume.is_some() {
+                    app.resume_step(if lines > 0.0 { -1 } else { 1 });
+                } else if app.rail_list_at(self.mouse.0 as f32, self.mouse.1 as f32) {
+                    app.scroll_rail(lines);
+                } else if app.timeline_open && app.timeline_at(self.mouse.0 as f32, self.mouse.1 as f32) {
                     app.scroll_timeline(lines);
                 } else {
                     app.scroll(lines, self.mods.shift_key());
@@ -579,6 +749,7 @@ impl ApplicationHandler for Win {
                 app.pump();
                 let (quads, animating) = app.frame();
                 gpu.renderer.upload(&mut app.glyphs.uploads);
+                gpu.renderer.upload_images(&mut app.image_atlas.uploads);
                 let frame = match gpu.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
                     wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -623,6 +794,8 @@ fn snapshot(theme: Theme, args: &Args, path: &str) {
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let mut renderer = gfx::Renderer::new(device, queue, format);
     let mut app = App::new(theme, args.scale, (w, h), Arc::new(|| {}));
+    app.persist = false;
+    app.apply_prefs(&state::load(), true);
     app.report_size = args.resize_tmux;
     app.set_hosts(hosts::load(&args.hosts));
     if args.attach {
@@ -669,7 +842,92 @@ fn snapshot(theme: Theme, args: &Args, path: &str) {
     }
     match args.show.as_deref() {
         Some("help") => app.toggle_help(),
+        Some("usage") => {
+            app.toggle_usage();
+            step(&mut app, 2500);
+        }
+        // "cdrag:N:G": session N's card held over group G's header.
+        Some(s) if s.starts_with("cdrag:") => {
+            let v: Vec<usize> = s["cdrag:".len()..].split(':').filter_map(|x| x.parse().ok()).collect();
+            if let [n, g] = v[..] {
+                app.drag_card_over(n, g);
+            }
+        }
+        // "divider:DX": drag the first side-by-side divider DX px.
+        Some(s) if s.starts_with("divider:") => {
+            let dx = s["divider:".len()..].parse().unwrap_or(0.0);
+            app.drag_divider_by(dx);
+            step(&mut app, 1200);
+        }
+        // "click:X,Y": a left click, reported to the program if it takes the mouse.
+        Some(s) if s.starts_with("click:") => {
+            let v: Vec<f32> = s["click:".len()..].split(',').filter_map(|n| n.parse().ok()).collect();
+            if let [x, y] = v[..] {
+                app.mouse_report(x, y, 0, true);
+                app.mouse_report(x, y, 0, false);
+                step(&mut app, 1000);
+            }
+        }
+        // "dclick:X,Y": a double-click there; prints what it selected.
+        Some(s) if s.starts_with("dclick:") => {
+            let v: Vec<f32> = s["dclick:".len()..].split(',').filter_map(|n| n.parse().ok()).collect();
+            if let [x, y] = v[..] {
+                app.mouse_down(x, y);
+                app.mouse_up();
+                app.mouse_down(x, y);
+                println!("selected: {:?}", app.selected_text());
+            }
+        }
+        // "hover:X,Y": Ctrl held over a point (the link underline).
+        Some(s) if s.starts_with("hover:") => {
+            let v: Vec<f32> = s["hover:".len()..].split(',').filter_map(|n| n.parse().ok()).collect();
+            if let [x, y] = v[..] {
+                app.hover_link(x, y, true);
+            }
+        }
+        // "link:X,Y": print the link at a point (what Ctrl+click would open).
+        Some(s) if s.starts_with("link:") => {
+            let v: Vec<f32> = s["link:".len()..].split(',').filter_map(|n| n.parse().ok()).collect();
+            if let [x, y] = v[..] {
+                println!("link: {:?}", app.link_uri_at(x, y));
+            }
+        }
+        // "accounts[:folded]": three account configs on this machine.
+        Some(s) if s.starts_with("accounts") => {
+            app.fake_accounts();
+            if s.ends_with(":folded") {
+                app.plan_collapsed = true;
+                app.load_collapsed = true;
+            }
+        }
+        // "resume[:N]": this machine's resume menu, row N picked.
+        Some(s) if s.starts_with("resume") => {
+            app.open_resume(0);
+            step(&mut app, 2500);
+            for _ in 0..s.trim_end_matches(":pick").strip_prefix("resume:").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0) {
+                app.resume_step(1);
+            }
+            if s.ends_with(":pick") {
+                app.resume_pick();
+                step(&mut app, 1500);
+            }
+        }
+        Some("stats") => app.fake_host_stats("app.example.com", sysstat::Load { cpu: 0.62, mem: 0.71, disk: Some(0.86) }),
+        // "menu:N": right-click the Nth session's card; "menu:gN" group N's header.
+        Some(s) if s.starts_with("menu:") => {
+            app.menu_target(&s["menu:".len()..]);
+        }
         Some("grid") => app.toggle_overview(),
+        // "relaunch": the local tmux session goes away (its last shell
+        // closed), then a new shell is asked for, as Ctrl+Shift+T would.
+        Some("relaunch") => {
+            let _ = std::process::Command::new("tmux").args(["kill-server"]).status();
+            step(&mut app, 1500);
+            println!("after close: {} panes, local {:?}", app.panes.len(), app.host_state.first());
+            app.new_session(0);
+            step(&mut app, 3000);
+            println!("after new: {} panes, local {:?}", app.panes.len(), app.host_state.first());
+        }
         Some(s) if s.starts_with("timeline") => {
             // Not toggle_timeline: a snapshot must not save prefs.
             app.timeline_open = true;
@@ -702,6 +960,7 @@ fn snapshot(theme: Theme, args: &Args, path: &str) {
     app.pump();
     let (quads, _) = app.frame();
     renderer.upload(&mut app.glyphs.uploads);
+    renderer.upload_images(&mut app.image_atlas.uploads);
 
     let tex = renderer.device.create_texture(&wgpu::TextureDescriptor {
         label: None,

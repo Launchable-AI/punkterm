@@ -22,3 +22,13 @@ punkterm's history. **Shift+wheel** always scrolls punkterm's history.
 While scrolled back, a badge in the terminal's top-right shows the position
 the way tmux's copy mode does: `[lines up/lines of history]`. It disappears
 when you're back at the bottom (typing also jumps back to the bottom).
+
+## Resizes
+
+When a tmux pane changes size, tmux reflows its own copy of the screen and
+history, and punkterm's copy would come out differently. Programs that only
+repaint part of the screen, such as Claude Code, then leave stale text that
+was wrapped at the old width. So about 300 ms after a pane's size settles,
+punkterm reads the pane from tmux again (`resync_at` in `term.rs`) and
+replaces its screen and history with that capture. The view jumps back to
+the bottom.

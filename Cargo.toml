@@ -9,6 +9,7 @@ alacritty_terminal = "0.26"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 cosmic-text = "0.19"
 dirs = "7.0.0"
+flate2 = "1.1"
 png = "0.18.1"
 pollster = "1.0.1"
 serde = { version = "1.0.229", features = ["derive"] }

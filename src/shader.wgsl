@@ -8,6 +8,8 @@ struct Globals {
 @group(0) @binding(0) var<uniform> g: Globals;
 @group(0) @binding(1) var atlas_tex: texture_2d<f32>;
 @group(0) @binding(2) var atlas_smp: sampler;
+@group(0) @binding(3) var images_tex: texture_2d<f32>;
+@group(0) @binding(4) var images_smp: sampler;
 
 struct Inst {
     @location(0) rect: vec4<f32>,   // x, y, w, h (px)
@@ -134,6 +136,12 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
         let cell = i.screen_px - floor(i.screen_px / radius) * radius - vec2(radius * 0.5);
         let a = clamp(border * 0.5 + 0.5 - length(cell), 0.0, 1.0);
         return vec4(i.color.rgb, i.color.a * a);
+    }
+    if (kind > 8.5) {
+        // An image slice: the quad shows uv's rect of the image atlas.
+        let st = (i.uv.xy + i.local / i.size * i.uv.zw) / g.atlas;
+        let t = textureSample(images_tex, images_smp, st);
+        return vec4(t.rgb, t.a * i.color.a);
     }
     if (kind > 7.5) {
         // Ambient light: a soft elliptical falloff from the rect's centre.

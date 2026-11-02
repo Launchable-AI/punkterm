@@ -76,14 +76,32 @@ pub struct Group {
     pub members: Vec<String>,
 }
 
+/// The rail's width (logical px): by default, and the range a drag keeps to.
+const RAIL_W: f32 = 292.0;
+const RAIL_MIN: f32 = 220.0;
+const RAIL_MAX: f32 = 600.0;
+
 /// The resume menu: one host's recent Claude sessions, newest first.
 pub struct ResumeMenu {
     pub host: usize,
     /// None while they are being read.
     pub items: Option<Result<Vec<crate::resume::Recent>, String>>,
+    /// Index into `shown()`.
     pub sel: usize,
     /// The first row in view.
     pub top: usize,
+    /// Typed to narrow the list.
+    pub query: String,
+}
+
+impl ResumeMenu {
+    /// The sessions that match the typed query, newest first.
+    pub fn shown(&self) -> Vec<&crate::resume::Recent> {
+        match &self.items {
+            Some(Ok(v)) => v.iter().filter(|r| r.matches(&self.query)).collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// One line of the footer's PLAN panel.
@@ -177,6 +195,10 @@ pub enum HostState {
     /// Reachable, but no tmux sessions to join.
     Empty,
     Failed(String),
+    /// Disconnected by you: left alone until you connect it again.
+    Off,
+    /// Removed by you: out of the rail.
+    Removed,
 }
 
 /// The connect prompt (⌃⇧N): an ssh destination or command, with
@@ -243,6 +265,8 @@ pub struct App {
     disc_rx: Receiver<(usize, Result<Vec<String>, String>)>,
     /// Hosts added from the prompt, remembered across runs.
     saved_hosts: Vec<String>,
+    /// config.toml hosts removed from the rail (ssh specs).
+    removed_hosts: Vec<String>,
     pub prompt: Option<Prompt>,
     prompt_t: f32,
     /// Report punkterm's size to tmux. Off for headless snapshots, which
@@ -335,6 +359,12 @@ pub struct App {
     pub plan_collapsed: bool,
     /// How far the rail's session list is scrolled (px).
     pub rail_scroll: f32,
+    /// The rail's width (logical px), set by dragging its edge; and that
+    /// drag while it lasts, with when the edge was last pressed (a second
+    /// press soon after resets the width).
+    pub rail_w: f32,
+    rail_drag: bool,
+    rail_pressed: Option<Instant>,
     /// The session the list last scrolled to show.
     rail_followed: Option<u64>,
     pub load_collapsed: bool,
@@ -411,6 +441,7 @@ impl App {
             disc_tx,
             disc_rx,
             saved_hosts: Vec::new(),
+            removed_hosts: Vec::new(),
             prompt: None,
             prompt_t: 0.0,
             report_size: true,
@@ -470,6 +501,9 @@ impl App {
             resume_rx,
             plan_collapsed: false,
             rail_scroll: 0.0,
+            rail_w: RAIL_W,
+            rail_drag: false,
+            rail_pressed: None,
             rail_followed: None,
             load_collapsed: false,
             known: crate::usage::load_known(),
@@ -498,7 +532,7 @@ impl App {
     fn layout(&self) -> Layout {
         let (w, h) = (self.size.0 as f32, self.size.1 as f32);
         let m = self.px(14.0);
-        let rail_w = self.px(292.0);
+        let rail_w = self.px(self.rail_w);
         let rail = Rect { x: m, y: m, w: rail_w, h: h - 2.0 * m };
         let tl_w = if self.timeline_open { self.px(340.0) } else { self.px(30.0) };
         let panel = Rect { x: rail.x + rail_w + m, y: m, w: (w - rail_w - tl_w - 4.0 * m).max(1.0), h: h - 2.0 * m };
@@ -545,6 +579,11 @@ impl App {
         let mut heads = Vec::new();
         let add = self.px(16.0);
         for h in 0..self.hosts.len() {
+            if self.host_state.get(h) == Some(&HostState::Removed) {
+                adds.push(Rect::default());
+                resumes.push(Rect::default());
+                continue;
+            }
             sections.push((h, y));
             adds.push(Rect { x: rail.x + rail.w - self.px(18.0) - add, y: y - self.px(3.0), w: add, h: add });
             resumes.push(Rect { x: rail.x + rail.w - self.px(18.0) - 2.0 * add - self.px(5.0), y: y - self.px(3.0), w: add, h: add });
@@ -794,7 +833,7 @@ impl App {
 
     fn layout_rail(&self) -> Rect {
         let m = self.px(14.0);
-        Rect { x: m, y: m, w: self.px(292.0), h: self.size.1 as f32 - 2.0 * m }
+        Rect { x: m, y: m, w: self.px(self.rail_w), h: self.size.1 as f32 - 2.0 * m }
     }
 
     /// A click on a footer panel's header: PLAN's collapses it (its ALL
@@ -844,6 +883,9 @@ impl App {
     /// Look for tmux sessions on a remote host, in the background.
     fn discover(&mut self, i: usize) {
         let Some(h) = self.hosts.get(i) else { return };
+        if self.host_state[i] == HostState::Removed {
+            return;
+        }
         self.host_state[i] = HostState::Connecting;
         let (dest, tx, wake) = (h.ssh.clone(), self.disc_tx.clone(), self.wake.clone());
         std::thread::spawn(move || {
@@ -856,7 +898,7 @@ impl App {
     pub fn reconnect(&mut self) {
         let mut n = 0;
         for i in 1..self.hosts.len() {
-            if !self.conns.iter().any(|c| c.host == i) && self.host_state[i] != HostState::Connecting {
+            if !self.conns.iter().any(|c| c.host == i) && !matches!(self.host_state[i], HostState::Connecting | HostState::Off | HostState::Removed) {
                 self.discover(i);
                 n += 1;
             }
@@ -871,7 +913,14 @@ impl App {
             return;
         }
         if let Some(i) = self.hosts.iter().position(|o| o.ssh == h.ssh) {
-            if let Some(p) = self.panes.iter().position(|p| p.host == i) {
+            if matches!(self.host_state[i], HostState::Off | HostState::Removed) {
+                self.removed_hosts.retain(|s| Some(s) != h.ssh.as_ref());
+                if self.host_state[i] == HostState::Removed && !self.saved_hosts.contains(h.ssh.as_ref().unwrap()) && !self.from_config(i) {
+                    self.saved_hosts.push(h.ssh.clone().unwrap_or_default());
+                }
+                self.save_prefs();
+                self.connect_host(i);
+            } else if let Some(p) = self.panes.iter().position(|p| p.host == i) {
                 self.select(p);
             } else {
                 self.discover(i);
@@ -887,6 +936,69 @@ impl App {
             self.saved_hosts.push(spec);
             self.save_prefs();
         }
+    }
+
+    /// Connect to host `h` again (after you disconnected or removed it).
+    pub fn connect_host(&mut self, h: usize) {
+        if h == 0 || h >= self.hosts.len() {
+            return;
+        }
+        self.toast(format!("CONNECT // {}", self.hosts[h].name.to_uppercase()));
+        self.host_state[h] = HostState::Connecting;
+        self.discover(h);
+    }
+
+    /// Let go of host `h`: detach from its tmux sessions (they keep running
+    /// there) and drop its sessions from the rail. It stays listed, OFF,
+    /// until you connect it again.
+    pub fn disconnect_host(&mut self, h: usize) {
+        if h == 0 || h >= self.hosts.len() {
+            return;
+        }
+        self.drop_host(h);
+        self.host_state[h] = HostState::Off;
+        self.toast(format!("DISCONNECT // {}", self.hosts[h].name.to_uppercase()));
+    }
+
+    /// Disconnect host `h` and take it out of the rail, and out of the hosts
+    /// punkterm connects to at launch.
+    pub fn remove_host(&mut self, h: usize) {
+        if h == 0 || h >= self.hosts.len() {
+            return;
+        }
+        self.drop_host(h);
+        self.host_state[h] = HostState::Removed;
+        let spec = self.hosts[h].ssh.clone().unwrap_or_default();
+        self.saved_hosts.retain(|s| *s != spec);
+        // One from config.toml (which punkterm only reads) is remembered as
+        // removed instead.
+        if self.from_config(h) && !self.removed_hosts.contains(&spec) {
+            self.removed_hosts.push(spec);
+        }
+        self.save_prefs();
+        self.toast(format!("REMOVED // {}", self.hosts[h].name.to_uppercase()));
+    }
+
+    /// Host `h` is listed in config.toml.
+    fn from_config(&self, h: usize) -> bool {
+        let Some(spec) = self.hosts.get(h).and_then(|x| x.ssh.clone()) else { return false };
+        crate::hosts::load(&[]).iter().any(|c| c.ssh.as_deref() == Some(spec.as_str()))
+    }
+
+    /// Close host `h`'s connections and drop its sessions.
+    fn drop_host(&mut self, h: usize) {
+        // Dropping a connection detaches it; tmux keeps the sessions.
+        self.conns.retain(|c| c.host != h);
+        let active_id = self.panes.get(self.active).filter(|p| p.host != h).map(|p| p.id).or_else(|| self.successor(|j| self.panes[j].host == h));
+        let keep: Vec<bool> = self.panes.iter().map(|p| p.host != h).collect();
+        let mut k = 0;
+        self.panes.retain(|_| { k += 1; keep[k - 1] });
+        let mut k = 0;
+        self.ui.retain(|_| { k += 1; keep[k - 1] });
+        self.active = active_id.and_then(|a| self.panes.iter().position(|p| p.id == a)).unwrap_or(0);
+        self.transition = None;
+        self.usage.remove(&h);
+        self.host_sys.remove(&h);
     }
 
     pub fn open_prompt(&mut self) {
@@ -981,6 +1093,10 @@ impl App {
         if h.ssh.is_none() && !tmux_installed() {
             self.spawn_pane(Spawn { program: None, args: vec![], cwd: std::env::current_dir().ok() }, host, None, true);
             return;
+        }
+        // A new session on a host you disconnected connects it again.
+        if self.host_state.get(host) == Some(&HostState::Off) {
+            self.host_state[host] = HostState::Connecting;
         }
         let (dest, tx, wake) = (h.ssh.clone(), self.disc_tx.clone(), self.wake.clone());
         std::thread::spawn(move || {
@@ -1215,6 +1331,12 @@ impl App {
             self.toggle_group(g);
         }
         true
+    }
+
+    /// The host whose heading in the rail is under (x, y).
+    pub fn host_head_at(&self, x: f32, y: f32) -> Option<usize> {
+        let l = self.layout();
+        l.sections.iter().find(|&&(_, sy)| x >= l.rail.x && x <= l.rail.x + l.rail.w && y >= sy - self.px(4.0) && y <= sy + self.px(16.0)).map(|&(h, _)| h)
     }
 
     pub fn head_at(&self, x: f32, y: f32) -> Option<usize> {
@@ -1743,8 +1865,10 @@ impl App {
             self.sound.set_mode(sound::Mode::parse(s));
         }
         self.saved_hosts = p.hosts.clone();
+        self.removed_hosts = p.removed_hosts.clone();
         self.timeline_open = p.timeline.unwrap_or(false);
         self.plan_collapsed = p.plan_collapsed.unwrap_or(false);
+        self.rail_w = p.rail_width.unwrap_or(RAIL_W).clamp(RAIL_MIN, RAIL_MAX);
         self.load_collapsed = p.load_collapsed.unwrap_or(false);
         self.groups = p.groups.iter().map(|g| Group { name: g.name.clone(), collapsed: g.collapsed, brief: g.brief, members: g.members.clone() }).collect();
         if !theme_flag {
@@ -1765,8 +1889,10 @@ impl App {
             opacity: Some(self.opacity),
             sound: Some(self.sound.mode.name().to_string()),
             hosts: self.saved_hosts.clone(),
+            removed_hosts: self.removed_hosts.clone(),
             timeline: Some(self.timeline_open),
             plan_collapsed: Some(self.plan_collapsed),
+            rail_width: Some(self.rail_w),
             load_collapsed: Some(self.load_collapsed),
             groups: self.groups.iter().map(|g| state::GroupPref { name: g.name.clone(), collapsed: g.collapsed, brief: g.brief, members: g.members.clone() }).collect(),
         });
@@ -2169,7 +2295,7 @@ impl App {
     pub fn open_resume(&mut self, host: usize) {
         let Some(h) = self.hosts.get(host) else { return };
         self.sound.play(Sfx::Blip);
-        self.resume = Some(ResumeMenu { host, items: None, sel: 0, top: 0 });
+        self.resume = Some(ResumeMenu { host, items: None, sel: 0, top: 0, query: String::new() });
         let (dest, tx, wake) = (h.ssh.clone(), self.resume_tx.clone(), self.wake.clone());
         std::thread::spawn(move || {
             let _ = tx.send((host, crate::resume::fetch(dest.as_deref())));
@@ -2187,7 +2313,7 @@ impl App {
     pub fn resume_step(&mut self, d: isize) {
         let rows = self.resume_rows();
         let Some(m) = self.resume.as_mut() else { return };
-        let n = m.items.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |v| v.len());
+        let n = m.shown().len();
         if n == 0 {
             return;
         }
@@ -2199,12 +2325,25 @@ impl App {
         }
     }
 
+    /// Typing in the resume menu: narrow the list (None: delete a character).
+    pub fn resume_type(&mut self, text: Option<&str>) {
+        let Some(m) = self.resume.as_mut() else { return };
+        match text {
+            Some(t) => m.query.push_str(t),
+            None => {
+                m.query.pop();
+            }
+        }
+        m.sel = 0;
+        m.top = 0;
+    }
+
     /// Resume the picked session: a new window on its host, in its folder,
     /// with `claude --resume` typed into the shell there (so the shell's
     /// PATH and aliases apply).
     pub fn resume_pick(&mut self) {
         let Some(m) = self.resume.take() else { return };
-        let Some(r) = m.items.and_then(|r| r.ok()).and_then(|v| v.into_iter().nth(m.sel)) else { return };
+        let Some(r) = m.shown().get(m.sel).map(|r| (*r).clone()) else { return };
         let host = m.host;
         let cmd = r.command();
         let label = if r.title.is_empty() { r.first.clone() } else { r.title.clone() };
@@ -2247,7 +2386,7 @@ impl App {
         let Some(m) = self.resume.as_mut() else { return };
         if x >= rx && x <= rx + pw && y >= list_y && y < list_y + rows as f32 * row_h {
             let k = m.top + ((y - list_y) / row_h) as usize;
-            let n = m.items.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |v| v.len());
+            let n = m.shown().len();
             if k < n {
                 m.sel = k;
                 self.resume_pick();
@@ -2492,6 +2631,59 @@ impl App {
         let (point, _) = self.term_point_in(i, x, y, false)?;
         let p = self.panes.get(i)?;
         crate::links::at(&p.term.lock(), point).map(|l| (p.id, l))
+    }
+
+    /// The rail's right edge (and the gap beside it) under (x, y): dragging
+    /// it sets the rail's width.
+    pub fn rail_edge_at(&self, x: f32, y: f32) -> bool {
+        let r = self.layout_rail();
+        let e = r.x + r.w;
+        x >= e - self.px(4.0) && x <= e + self.px(14.0) && y >= r.y && y <= r.y + r.h
+    }
+
+    /// Press on the rail's edge: start dragging it (a double press resets
+    /// the width).
+    pub fn rail_edge_press(&mut self, x: f32, y: f32) -> bool {
+        if !self.rail_edge_at(x, y) {
+            return false;
+        }
+        if self.rail_pressed.is_some_and(|t| t.elapsed().as_millis() < 400) {
+            self.rail_pressed = None;
+            self.set_rail_w(RAIL_W);
+            self.save_prefs();
+            return true;
+        }
+        self.rail_pressed = Some(Instant::now());
+        self.rail_drag = true;
+        true
+    }
+
+    /// Dragging the edge: the rail follows the pointer, the panel and its
+    /// terminals (and tmux) the rail.
+    pub fn rail_edge_drag(&mut self, x: f32) -> bool {
+        if !self.rail_drag {
+            return false;
+        }
+        let w = ((x - self.px(14.0)) / self.scale).round();
+        self.set_rail_w(w);
+        true
+    }
+
+    pub fn rail_edge_release(&mut self) -> bool {
+        if std::mem::take(&mut self.rail_drag) {
+            self.save_prefs();
+            return true;
+        }
+        false
+    }
+
+    fn set_rail_w(&mut self, w: f32) {
+        let w = w.clamp(RAIL_MIN, RAIL_MAX);
+        if (w - self.rail_w).abs() >= 1.0 {
+            self.rail_w = w;
+            let (size, scale) = (self.size, self.scale);
+            self.resize(size, scale);
+        }
     }
 
     /// The rail's session list under (x, y): the wheel scrolls it there.
@@ -2821,6 +3013,9 @@ impl App {
             dirty = true;
         }
         while let Ok((host, res)) = self.disc_rx.try_recv() {
+            if matches!(self.host_state.get(host), Some(HostState::Off | HostState::Removed)) {
+                continue;
+            }
             let name = self.hosts.get(host).map(|h| h.name.to_uppercase()).unwrap_or_default();
             match res {
                 Ok(names) if names.is_empty() => {

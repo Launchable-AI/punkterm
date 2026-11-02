@@ -90,7 +90,9 @@ Remote hosts need tmux; the Claude features also need `python3`.
 | Ctrl+Shift+D | Dashboard |
 | Ctrl+Shift+H | Conversation timeline |
 | Ctrl+Shift+U | Plan usage for every account on your hosts |
-| ↺ beside a host | Resume one of its recent Claude sessions |
+| ↺ beside a host | Resume one of its recent Claude sessions (type to search them) |
+| Right-click a host's heading | Disconnect, connect or remove that host |
+| Drag the rail's edge | Make the rail wider or narrower (double-click: back to the default) |
 | Ctrl+Shift+N / R | Connect to a host / reconnect |
 | Ctrl+Shift+P / O | Cycle theme / opacity |
 | Ctrl+= / Ctrl+- | Text size |

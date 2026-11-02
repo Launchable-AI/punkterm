@@ -517,6 +517,7 @@ impl App {
                     HostState::Connecting | HostState::Up => ("CONNECTING…".to_string(), t.busy),
                     HostState::Empty => ("NO TMUX SESSIONS // ⌃⇧T STARTS ONE".to_string(), t.muted),
                     HostState::Failed(e) => (format!("✕ {}", e.to_uppercase()), t.alert),
+                    HostState::Off | HostState::Removed => ("DISCONNECTED // RIGHT-CLICK TO CONNECT".to_string(), t.muted),
                 };
                 let msg = self.fit(&msg, Font::Mono, 9.0, 600, right - hx);
                 self.label(q, &msg, Font::Mono, 9.0, 600, 0.0, hx, sy + self.px(18.0), col);
@@ -1112,7 +1113,9 @@ impl App {
     fn resume_layer(&mut self, q: &mut Vec<Quad>) {
         let Some(m) = self.resume.as_ref() else { return };
         let (host, sel, top) = (m.host, m.sel, m.top);
-        let items = m.items.clone();
+        let query = m.query.clone();
+        let total = m.items.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |v| v.len());
+        let items = m.items.clone().map(|r| r.map(|_| m.shown().into_iter().cloned().collect::<Vec<_>>()));
         let t = self.theme.clone();
         let (w, h) = (self.size.0 as f32, self.size.1 as f32);
         self.rect(q, Rect { x: 0.0, y: 0.0, w, h }, with_alpha(t.bg, 0.72), 0.0, NO_CLIP);
@@ -1132,10 +1135,27 @@ impl App {
         let hw = self.label(q, "RESUME", Font::Ui, 15.0, 800, 3.4, x, y0, t.accent);
         let hname = self.hosts.get(host).map_or(String::new(), |h| h.name.to_uppercase());
         self.meta(q, &[&hname, "RECENT CLAUDE SESSIONS"], x + hw + self.px(18.0), y0 + self.px(4.0), self.host_color(host));
-        let esc = "↑↓  ↵ RESUME  ·  ESC";
+        let esc = if query.is_empty() { "↑↓  ↵ RESUME  ·  ESC" } else { "↑↓  ↵ RESUME  ·  ESC CLEARS" };
         let ew = self.measure(esc, Font::Mono, 9.5, 600, 1.2);
         self.label(q, esc, Font::Mono, 9.5, 600, 1.2, right - ew, y0 + self.px(4.0), t.muted);
         let ly = r.y + self.px(84.0);
+        // The search line: what you've typed, or how to start.
+        let sy = r.y + self.px(50.0);
+        let gw = self.label(q, "⌕", Font::Mono, 12.0, 600, 0.0, x, sy - self.px(1.0), if query.is_empty() { t.muted } else { t.accent2 });
+        let qx = x + gw + self.px(8.0);
+        if query.is_empty() {
+            self.label(q, "type to search titles, prompts, folders, branches", Font::Mono, 11.0, 400, 0.0, qx, sy, t.muted);
+        } else {
+            let shown = self.fit(&query, Font::Mono, 11.0, 600, right - qx - self.px(120.0));
+            let qw = self.label(q, &shown, Font::Mono, 11.0, 600, 0.0, qx, sy, t.fg);
+            self.rect(q, Rect { x: qx + qw + self.px(2.0), y: sy - self.px(1.0), w: self.px(7.0), h: self.px(14.0) }, t.accent2, 0.0, NO_CLIP);
+        }
+        if !query.is_empty() && total > 0 {
+            let n = items.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |v| v.len());
+            let c = format!("{n} OF {total}");
+            let cw = self.measure(&c, Font::Mono, 9.5, 600, 1.0);
+            self.label(q, &c, Font::Mono, 9.5, 600, 1.0, right - cw, sy + self.px(1.0), t.muted);
+        }
         self.rect(q, Rect { x, y: ly - self.px(12.0), w: right - x, h: self.px(1.0).max(1.0) }, t.border, 0.0, NO_CLIP);
         let list = match items {
             None => {
@@ -1144,6 +1164,10 @@ impl App {
             }
             Some(Err(e)) => {
                 self.label(q, &e, Font::Mono, 11.0, 500, 0.0, x, ly, t.alert);
+                return;
+            }
+            Some(Ok(v)) if v.is_empty() && total > 0 => {
+                self.label(q, "no sessions match", Font::Mono, 11.0, 500, 0.0, x, ly, t.muted);
                 return;
             }
             Some(Ok(v)) if v.is_empty() => {

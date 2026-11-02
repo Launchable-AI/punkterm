@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 const SCRIPT: &str = r#"
 import glob, json, os
 home = os.path.expanduser('~')
-N = 40
+N = 150
 def load(p):
     try:
         with open(p) as f: return json.load(f)
@@ -112,6 +112,13 @@ impl Recent {
         Some(base.strip_prefix(".claude-").unwrap_or(base))
     }
 
+    /// Whether every word of `query` is in its title, prompts, folder,
+    /// branch, account or id (any case).
+    pub fn matches(&self, query: &str) -> bool {
+        let hay = [&self.title, &self.first, &self.last, &self.cwd, &self.branch, &self.config, &self.id].map(|s| s.to_lowercase()).join("\n");
+        query.split_whitespace().all(|w| hay.contains(&w.to_lowercase()))
+    }
+
     /// What to type in a shell on the host to resume it.
     pub fn command(&self) -> String {
         let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
@@ -176,6 +183,15 @@ mod tests {
         let r = parse("abc\t1700\t/h/.claude-dev1\t/h/x\tmain\tFix it\tfirst\tlast\t1").unwrap();
         assert_eq!((r.id.as_str(), r.mtime, r.open, r.config_name()), ("abc", 1700, true, Some("dev1")));
         assert!(parse("too\tfew").is_none());
+    }
+
+    #[test]
+    fn matches_words() {
+        let r = Recent { id: "abc".into(), title: "Fix the Rail".into(), cwd: "/h/punkterm".into(), branch: "main".into(), ..Default::default() };
+        assert!(r.matches(""));
+        assert!(r.matches("rail punk"));
+        assert!(r.matches("MAIN"));
+        assert!(!r.matches("rail usage"));
     }
 
     #[test]

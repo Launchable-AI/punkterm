@@ -2,7 +2,8 @@
 
 Code: `src/ui/menu.rs` (items and actions), `src/ui/chrome.rs` (`menu_layer`).
 
-Right-click a session's card in the rail, or a group's header. Pick with the
+Right-click a session's card in the rail, a group's header, or a host's
+heading. Pick with the
 mouse, or ↑ ↓ and ↵; any other key or a click outside closes it.
 
 **On a session** (items show only where they apply):
@@ -21,3 +22,7 @@ mouse, or ↑ ↓ and ↵; any other key or a click outside closes it.
 | Detach (keeps running) | Drop it from punkterm; it keeps running in tmux |
 
 **On a group header:** Roll up / Expand, Rename group…, Ungroup all.
+
+**On a host heading:** New shell, Resume a Claude session…, and for a remote
+host Disconnect (sessions keep running) or Connect, and Remove host (see
+[hosts.md](hosts.md)).

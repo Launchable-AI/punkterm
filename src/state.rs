@@ -10,11 +10,15 @@ pub struct Prefs {
     pub sound: Option<String>,
     /// ssh specs of hosts added from the connect prompt.
     pub hosts: Vec<String>,
+    /// ssh specs of config.toml hosts removed from the rail.
+    pub removed_hosts: Vec<String>,
     /// The timeline rail is expanded.
     pub timeline: Option<bool>,
     /// The rail footer's PLAN and LOAD panels are folded to a line each.
     pub plan_collapsed: Option<bool>,
     pub load_collapsed: Option<bool>,
+    /// The rail's width, as dragged (logical px).
+    pub rail_width: Option<f32>,
     pub groups: Vec<GroupPref>,
 }
 
@@ -44,9 +48,13 @@ pub fn load() -> Prefs {
         hosts: get("hosts")
             .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|h| h.as_str().map(str::to_string)).collect()))
             .unwrap_or_default(),
+        removed_hosts: get("removed_hosts")
+            .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|h| h.as_str().map(str::to_string)).collect()))
+            .unwrap_or_default(),
         timeline: get("timeline").and_then(|v| v.as_bool()),
         plan_collapsed: get("plan_collapsed").and_then(|v| v.as_bool()),
         load_collapsed: get("load_collapsed").and_then(|v| v.as_bool()),
+        rail_width: get("rail_width").and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64))).map(|f| f as f32),
         groups: get("groups")
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default()
@@ -82,8 +90,14 @@ pub fn save(p: &Prefs) {
     if !p.hosts.is_empty() {
         t.insert("hosts".into(), toml::Value::Array(p.hosts.iter().map(|h| h.clone().into()).collect()));
     }
+    if !p.removed_hosts.is_empty() {
+        t.insert("removed_hosts".into(), toml::Value::Array(p.removed_hosts.iter().map(|h| h.clone().into()).collect()));
+    }
     if let Some(v) = p.timeline {
         t.insert("timeline".into(), v.into());
+    }
+    if let Some(v) = p.rail_width {
+        t.insert("rail_width".into(), (v as f64).into());
     }
     for (k, v) in [("plan_collapsed", p.plan_collapsed), ("load_collapsed", p.load_collapsed)] {
         if let Some(v) = v {

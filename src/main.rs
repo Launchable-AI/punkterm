@@ -224,7 +224,9 @@ impl ApplicationHandler for Win {
             app.opacity = 1.0;
         }
         if self.cmds.is_empty() {
-            app.start(hosts::load(&[prefs.hosts, std::mem::take(&mut self.hosts)].concat()));
+            let mut hs = hosts::load(&[prefs.hosts.clone(), std::mem::take(&mut self.hosts)].concat());
+            hs.retain(|h| h.ssh.as_ref().is_none_or(|s| !prefs.removed_hosts.contains(s)));
+            app.start(hs);
         }
         for c in std::mem::take(&mut self.cmds) {
             app.spawn(spawn_spec(Some(&c), false));
@@ -328,12 +330,33 @@ impl ApplicationHandler for Win {
                 }
                 if app.resume.is_some() {
                     match code {
-                        Some(KeyCode::ArrowDown | KeyCode::KeyJ) => app.resume_step(1),
-                        Some(KeyCode::ArrowUp | KeyCode::KeyK) => app.resume_step(-1),
+                        Some(KeyCode::ArrowDown) => app.resume_step(1),
+                        Some(KeyCode::ArrowUp) => app.resume_step(-1),
+                        Some(KeyCode::KeyN) if m.control_key() => app.resume_step(1),
+                        Some(KeyCode::KeyP) if m.control_key() => app.resume_step(-1),
                         Some(KeyCode::PageDown) => app.resume_step(8),
                         Some(KeyCode::PageUp) => app.resume_step(-8),
                         Some(KeyCode::Enter | KeyCode::NumpadEnter) => app.resume_pick(),
-                        Some(KeyCode::Escape | KeyCode::KeyQ) => app.resume = None,
+                        Some(KeyCode::Backspace) => app.resume_type(None),
+                        // Esc clears the search first, then closes.
+                        Some(KeyCode::Escape) if app.resume.as_ref().is_some_and(|r| !r.query.is_empty()) => {
+                            if let Some(r) = app.resume.as_mut() {
+                                r.query.clear();
+                                r.sel = 0;
+                                r.top = 0;
+                            }
+                        }
+                        Some(KeyCode::Escape) => app.resume = None,
+                        Some(KeyCode::KeyV) if m.control_key() => {
+                            if let Some(t) = clipboard::paste() {
+                                app.resume_type(Some(t.lines().next().unwrap_or("")));
+                            }
+                        }
+                        _ if !m.control_key() && !m.alt_key() => {
+                            if let Some(t) = event.text.as_ref().filter(|t| !t.chars().any(char::is_control)) {
+                                app.resume_type(Some(t));
+                            }
+                        }
                         _ => {}
                     }
                     gpu.window.request_redraw();
@@ -602,12 +625,19 @@ impl ApplicationHandler for Win {
                     }
                     return;
                 }
+                if app.rail_edge_drag(position.x as f32) {
+                    gpu.window.request_redraw();
+                    return;
+                }
                 if app.divider_drag(position.x as f32, position.y as f32) {
                     gpu.window.request_redraw();
                     return;
                 }
                 // Over a split divider: a resize pointer.
-                let over = app.divider_at(position.x as f32, position.y as f32).map(|(_, v)| v);
+                let over = app
+                    .divider_at(position.x as f32, position.y as f32)
+                    .map(|(_, v)| v)
+                    .or_else(|| app.rail_edge_at(position.x as f32, position.y as f32).then_some(true));
                 if over != app.divider_hover {
                     app.divider_hover = over;
                     gpu.window.set_cursor(match over {
@@ -637,7 +667,7 @@ impl ApplicationHandler for Win {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
-                if app.divider_release() {
+                if app.divider_release() | app.rail_edge_release() {
                     gpu.window.request_redraw();
                 }
                 if app.card_drop(self.mouse.0 as f32, self.mouse.1 as f32) {
@@ -680,6 +710,8 @@ impl ApplicationHandler for Win {
                     gpu.window.request_redraw();
                 } else if app.resume.is_some() {
                     app.resume_click(mx, my);
+                    gpu.window.request_redraw();
+                } else if !app.help && !app.overview && !app.usage_open && app.rail_edge_press(mx, my) {
                     gpu.window.request_redraw();
                 } else if app.usage_open {
                     app.toggle_usage();
@@ -900,10 +932,21 @@ fn snapshot(theme: Theme, args: &Args, path: &str) {
                 app.load_collapsed = true;
             }
         }
-        // "resume[:N]": this machine's resume menu, row N picked.
+        // "resume[/QUERY][:N[:pick]]": this machine's resume menu, QUERY
+        // typed, row N picked.
         Some(s) if s.starts_with("resume") => {
             app.open_resume(0);
             step(&mut app, 2500);
+            let (s, query) = match s.split_once('/') {
+                Some((a, b)) => {
+                    let (q, rest) = b.split_once(':').map_or((b, ""), |(q, r)| (q, r));
+                    (if rest.is_empty() { a.to_string() } else { format!("{a}:{rest}") }, q.to_string())
+                }
+                None => (s.to_string(), String::new()),
+            };
+            for c in query.chars() {
+                app.resume_type(Some(&c.to_string()));
+            }
             for _ in 0..s.trim_end_matches(":pick").strip_prefix("resume:").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0) {
                 app.resume_step(1);
             }
@@ -912,10 +955,32 @@ fn snapshot(theme: Theme, args: &Args, path: &str) {
                 step(&mut app, 1500);
             }
         }
+        // "raildrag:X": drag the rail's edge to x = X.
+        Some(s) if s.starts_with("raildrag:") => {
+            if let Ok(x) = s["raildrag:".len()..].parse::<f32>() {
+                let e = 14.0 * args.scale + app.rail_w * args.scale;
+                app.rail_edge_press(e + 2.0, 200.0);
+                app.rail_edge_drag(x);
+                app.rail_edge_release();
+                step(&mut app, 800);
+            }
+        }
         Some("stats") => app.fake_host_stats("app.example.com", sysstat::Load { cpu: 0.62, mem: 0.71, disk: Some(0.86) }),
-        // "menu:N": right-click the Nth session's card; "menu:gN" group N's header.
+        // "menu:N": right-click the Nth session's card; "menu:gN" group N's
+        // header; "menu:hN" host N's heading.
         Some(s) if s.starts_with("menu:") => {
             app.menu_target(&s["menu:".len()..]);
+        }
+        // "hostoff:N" / "hostrm:N": disconnect or remove host N (0: local).
+        Some(s) if s.starts_with("hostoff:") || s.starts_with("hostrm:") => {
+            let (off, n) = s.split_once(':').map(|(a, n)| (a == "hostoff", n.parse::<usize>().unwrap_or(0))).unwrap();
+            step(&mut app, 2500);
+            if off {
+                app.disconnect_host(n);
+            } else {
+                app.remove_host(n);
+            }
+            println!("hosts: {:?}", app.hosts.iter().zip(&app.host_state).map(|(h, s)| format!("{} {s:?}", h.name)).collect::<Vec<_>>());
         }
         Some("grid") => app.toggle_overview(),
         // "relaunch": the local tmux session goes away (its last shell

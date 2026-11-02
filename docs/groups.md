@@ -61,3 +61,11 @@ The session list scrolls in the room above the rail's footer: the wheel over
 it scrolls it, ↑ MORE / ↓ MORE say there is more above or below, and moving
 to a session (Ctrl+], a number, a click elsewhere) scrolls its card into
 view. Only whole cards are drawn.
+
+## The rail's width
+
+Drag the rail's right edge (the gap between it and the terminal panel; the
+pointer turns into a resize arrow there) to make it wider or narrower,
+220 to 600 px; the panel and its terminals, and tmux with them, take the
+rest. Double-click the edge for the default width again. The width is kept
+in punkterm's state file across restarts.

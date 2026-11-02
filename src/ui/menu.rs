@@ -20,6 +20,11 @@ pub enum Act {
     Toggle(usize),
     Disband(usize),
     Detach,
+    HostNew(usize),
+    HostResume(usize),
+    HostConnect(usize),
+    HostDisconnect(usize),
+    HostRemove(usize),
 }
 
 pub struct Item {
@@ -75,7 +80,9 @@ fn divider() -> Item {
 impl App {
     /// Right-click: a menu for the card or group header under (x, y).
     pub fn open_menu(&mut self, x: f32, y: f32) -> bool {
-        let menu = if let Some(g) = self.head_at(x, y) {
+        let menu = if let Some(h) = self.host_head_at(x, y) {
+            self.host_menu(h)
+        } else if let Some(g) = self.head_at(x, y) {
             self.group_menu(g)
         } else if let Some(i) = self.card_at(x, y) {
             self.card_menu(i)
@@ -90,9 +97,11 @@ impl App {
     /// with its second row lit.
     pub fn menu_target(&mut self, which: &str) {
         let l = self.layout();
-        let r = match which.strip_prefix('g') {
-            Some(g) => g.parse::<usize>().ok().and_then(|g| l.heads.iter().find(|h| h.0 + 1 == g)).map(|h| h.2),
-            None => which.parse::<usize>().ok().and_then(|n| l.cards.get(n.wrapping_sub(1)).copied()),
+        let r = match (which.strip_prefix('g'), which.strip_prefix('h')) {
+            (Some(g), _) => g.parse::<usize>().ok().and_then(|g| l.heads.iter().find(|h| h.0 + 1 == g)).map(|h| h.2),
+            // "hN": host N's heading (1-based).
+            (_, Some(h)) => h.parse::<usize>().ok().and_then(|h| l.sections.iter().find(|s| s.0 + 1 == h)).map(|s| Rect { x: l.rail.x + self.px(20.0), y: s.1, w: self.px(60.0), h: self.px(12.0) }),
+            _ => which.parse::<usize>().ok().and_then(|n| l.cards.get(n.wrapping_sub(1)).copied()),
         };
         if let Some(r) = r {
             let (x, y) = (r.x + r.w * 0.6, r.y + r.h / 2.0);
@@ -126,6 +135,23 @@ impl App {
         let (Some(c), Some(h)) = (l.cards.get(n.wrapping_sub(1)).copied(), l.heads.iter().find(|h| h.0 + 1 == g).map(|h| h.2)) else { return };
         self.card_press(n - 1, c.x + 40.0, c.y + 10.0);
         self.card_drag_to(h.x + 60.0, h.y + h.h / 2.0);
+    }
+
+    fn host_menu(&self, h: usize) -> Menu {
+        use super::HostState;
+        let host = &self.hosts[h];
+        let mut items = vec![item("New shell", Act::HostNew(h)), item("Resume a Claude session…", Act::HostResume(h))];
+        if h > 0 {
+            items.push(divider());
+            let on = self.conns.iter().any(|c| c.host == h) || self.host_state.get(h) == Some(&HostState::Connecting);
+            items.push(if on {
+                item("Disconnect (sessions keep running)", Act::HostDisconnect(h))
+            } else {
+                item("Connect", Act::HostConnect(h))
+            });
+            items.push(item("Remove host", Act::HostRemove(h)));
+        }
+        Menu { pane: None, title: host.name.to_uppercase(), items, at: (0.0, 0.0), hover: None }
     }
 
     fn group_menu(&self, g: usize) -> Menu {
@@ -221,6 +247,11 @@ impl App {
         let i = m.pane.and_then(|id| self.panes.iter().position(|p| p.id == id));
         match (act, i) {
             (Act::Toggle(g), _) => self.toggle_group(g),
+            (Act::HostNew(h), _) => self.new_session(h),
+            (Act::HostResume(h), _) => self.open_resume(h),
+            (Act::HostConnect(h), _) => self.connect_host(h),
+            (Act::HostDisconnect(h), _) => self.disconnect_host(h),
+            (Act::HostRemove(h), _) => self.remove_host(h),
             (Act::Rename(g), _) => self.rename_group(Some(g)),
             (Act::Disband(g), _) => {
                 if g < self.groups.len() {

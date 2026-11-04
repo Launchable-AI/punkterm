@@ -83,6 +83,7 @@ impl App {
         self.rail(&mut q, &l, dt, &mut animating);
         self.panel(&mut q, &l);
         self.header(&mut q, &l);
+        self.tasks_rail(&mut q, &l);
         self.timeline_rail(&mut q, &l);
         animating |= self.ui.iter().any(|u| u.status == Status::Working);
 
@@ -128,7 +129,7 @@ impl App {
         self.resume_layer(&mut q);
         self.help_layer(&mut q, dt, &mut animating);
         self.prompt_layer(&mut q, dt, &mut animating);
-        (q, animating)
+        (q, animating || self.size_pending())
     }
 
     // ------------------------------------------------------------ primitives
@@ -191,7 +192,8 @@ impl App {
 
     /// Meta-text: segments joined by an accent `//`.
     fn meta(&mut self, q: &mut Vec<Quad>, parts: &[&str], x: f32, y: f32, col: Rgba) -> f32 {
-        let sep = with_alpha(self.theme.accent, 0.8);
+        // Fades with the text it separates.
+        let sep = with_alpha(self.theme.accent, 0.8 * col[3]);
         let mut cx = x;
         for (i, p) in parts.iter().enumerate() {
             if i > 0 {
@@ -216,7 +218,7 @@ impl App {
         } else {
             self.shape(q, r, with_alpha(col, 0.13), Some(with_alpha(col, 0.65)), [cut, 0.0, cut, 0.0]);
         }
-        let tc = if solid { self.theme.bg } else { col };
+        let tc = if solid { with_alpha(self.theme.bg, col[3]) } else { col };
         self.text(q, &k, r.x + self.px(8.0), cy - k.height / 2.0, tc, NO_CLIP);
         w
     }
@@ -613,11 +615,8 @@ impl App {
             } else {
                 self.shape(q, c, with_alpha(t.surface_alt, 0.35 * appear), None, [cut, 0.0, 0.0, 0.0]);
             }
-            if status == Status::Blocked {
-                let breathe = 0.5 + 0.5 * (time * std::f32::consts::TAU / 1.8).sin();
-                self.shape(q, c, with_alpha(t.alert, 0.05 + 0.06 * breathe), Some(with_alpha(t.alert, 0.35 + 0.45 * breathe)), [cut, 0.0, 0.0, 0.0]);
-                *animating = true;
-            }
+            // A session waiting on you shows it in its INPUT chip and red
+            // subtitle only: the card's own highlight is for the selection.
             if bell > 0.0 {
                 self.shape(q, c, with_alpha(t.accent, 0.22 * bell), None, [cut, 0.0, 0.0, 0.0]);
             }
@@ -908,6 +907,7 @@ const KEYS_SESSIONS: &[(&str, &str)] = &[
     ("⌃⇧␣", "Next session that needs you"),
     ("⌃⇧D", "Session grid (dashboard)"),
     ("⌃⇧H", "Conversation timeline (right rail)"),
+    ("⌃⇧K", "Background tasks: agents, shells (right rail)"),
     ("⌃⇧U", "Plan usage, every account"),
 ];
 
@@ -1098,11 +1098,260 @@ impl App {
         }
     }
 
+    /// The tasks rail: the active session's sub-agents and background
+    /// shells, what each is for and doing now, running or how it ended;
+    /// then the other sessions with work running, to switch to. Collapsed,
+    /// a strip with the active session's running count and a tick for each.
+    fn tasks_rail(&mut self, q: &mut Vec<Quad>, l: &Layout) {
+        use crate::tasks::{Kind, State};
+        let t = self.theme.clone();
+        let r = l.tasks;
+        let c = self.px(18.0);
+        let cuts = [0.0, c, 0.0, c];
+        q.push(Quad {
+            rect: [r.x, r.y + self.px(8.0), r.w, r.h],
+            uv: cuts,
+            color: [0.0, 0.0, 0.0, 0.45],
+            params: [kind::SHADOW, 0.0, 0.0, self.px(16.0)],
+            clip: NO_CLIP,
+            ..Default::default()
+        });
+        self.shape(q, r, with_alpha(t.surface, 0.78 * self.opacity), Some(t.border), cuts);
+        let mine = self.tasks_of(self.active).cloned().unwrap_or_default();
+        let run = self.status_color(Status::Working);
+        let tone = |s: State| match s {
+            State::Running => run,
+            State::Done => t.muted,
+            State::Failed => t.alert,
+            State::Stopped => mix(t.muted, t.fg, 0.2),
+        };
+        let running: Vec<&crate::tasks::Task> = mine.tasks.iter().filter(|k| k.state == State::Running).collect();
+
+        if !self.tasks_open {
+            let label = self.measure("‹", Font::Ui, 14.0, 700, 0.0);
+            self.label(q, "‹", Font::Ui, 14.0, 700, 0.0, r.x + (r.w - label) / 2.0, r.y + self.px(14.0), t.muted);
+            if !running.is_empty() {
+                let n = running.len().to_string();
+                let nw = self.measure(&n, Font::Mono, 11.0, 700, 0.0);
+                self.label(q, &n, Font::Mono, 11.0, 700, 0.0, r.x + (r.w - nw) / 2.0, r.y + self.px(40.0), run);
+            }
+            // A tick per task, newest at the top: agents long, shells short.
+            let mut y = r.y + self.px(62.0);
+            for k in mine.tasks.iter().take(40) {
+                if y > r.y + r.h - self.px(20.0) {
+                    break;
+                }
+                let w = self.px(if k.kind == Kind::Agent { 14.0 } else { 8.0 });
+                let a = if k.state == State::Running { 0.9 } else { 0.35 };
+                self.rect(q, Rect { x: r.x + (r.w - w) / 2.0, y, w, h: self.px(2.0).max(1.0) }, with_alpha(tone(k.state), a), 0.0, NO_CLIP);
+                y += self.px(6.0);
+            }
+            return;
+        }
+
+        let x = r.x + self.px(18.0);
+        let right = r.x + r.w - self.px(18.0);
+        self.label(q, "TASKS", Font::Ui, 12.0, 800, 3.0, x, r.y + self.px(17.0), t.accent);
+        let keys = "⌃⇧K";
+        let kw = self.measure(keys, Font::Mono, 9.5, 500, 0.0);
+        self.label(q, keys, Font::Mono, 9.5, 500, 0.0, right - kw, r.y + self.px(19.0), t.muted);
+        // DETAIL / BRIEF: every task's steps shown, or only those clicked.
+        let word = if self.tasks_detail { "DETAIL" } else { "BRIEF" };
+        let cw = self.chip(q, word, if self.tasks_detail { t.accent2 } else { t.muted }, right - kw - self.px(12.0), r.y + self.px(24.0), self.tasks_detail);
+        self.tk_toggle = Rect { x: right - kw - self.px(12.0) - cw - self.px(4.0), y: r.y + self.px(12.0), w: cw + self.px(8.0), h: self.px(24.0) };
+        let count = |kind: Kind, one: &str| -> Option<String> {
+            let n = mine.running(kind);
+            (n > 0).then(|| format!("{n} {one}{}", if n == 1 { "" } else { "S" }))
+        };
+        let summary: Vec<String> = [count(Kind::Agent, "AGENT"), count(Kind::Shell, "SHELL")].into_iter().flatten().collect();
+        let summary = if summary.is_empty() { "NOTHING RUNNING".to_string() } else { summary.join(" · ") };
+        let title = self.panes.get(self.active).map(|p| if p.title.is_empty() { p.subtitle.clone() } else { super::clean_title(&p.title) }).unwrap_or_default().to_uppercase();
+        let room = right - x - self.measure(&summary, Font::Mono, 9.5, 500, 1.2) - self.px(30.0);
+        let title = self.fit(&title, Font::Mono, 9.5, 500, room.max(0.0));
+        self.meta(q, &[&title, &summary], x, r.y + self.px(40.0), t.muted);
+        let hy = r.y + self.px(62.0);
+        self.rect(q, Rect { x, y: hy, w: right - x, h: self.px(1.0).max(1.0) }, t.border, 0.0, NO_CLIP);
+
+        // Other sessions with work running, at the bottom: one line each.
+        let others: Vec<(usize, usize, usize)> = (0..self.panes.len())
+            .filter(|&j| j != self.active)
+            .filter_map(|j| self.tasks_of(j).map(|s| (j, s.running(Kind::Agent), s.running(Kind::Shell))))
+            .filter(|&(_, a, s)| a + s > 0)
+            .collect();
+        let row_o = self.px(20.0);
+        let others_h = if others.is_empty() { 0.0 } else { self.px(34.0) + others.len().min(8) as f32 * row_o };
+        let body = Rect { x, y: hy + self.px(14.0), w: right - x, h: (r.y + r.h - self.px(18.0) - others_h - hy - self.px(14.0)).max(0.0) };
+        let clip = [body.x - self.px(8.0), body.y, right + self.px(2.0), body.y + body.h];
+        self.tk_hits.clear();
+
+        if mine.tasks.is_empty() {
+            let msg = if self.tasks_of(self.active).is_some() {
+                "NO AGENTS OR BACKGROUND SHELLS"
+            } else if self.active_pane().is_some_and(|p| p.tmux_pane.is_some()) {
+                "NO CLAUDE SESSION HERE"
+            } else {
+                "NOT A TMUX PANE"
+            };
+            self.label(q, msg, Font::Mono, 9.5, 500, 1.2, x, body.y + self.px(4.0), t.muted);
+        }
+        let size = 11.0;
+        let cw = self.measure("0", Font::Mono, size, 400, 0.0).max(1.0);
+        let tx = x + self.px(16.0);
+        let per = (((right - tx) / cw) as usize).max(8);
+        let small = self.measure("0", Font::Mono, 10.0, 400, 0.0).max(1.0);
+        let per_log = (((right - tx - self.px(10.0)) / small) as usize).max(8);
+        let (tag_h, line_h, log_h, gap) = (self.px(15.0), self.px(16.0), self.px(14.0), self.px(12.0));
+        let now = crate::usage::now_ms();
+        // Lay every task out first: (task, description lines, now line, steps).
+        let cut = |s: &str, n: usize| -> String { if s.chars().count() > n { s.chars().take(n.saturating_sub(1)).chain(['…']).collect() } else { s.to_string() } };
+        let laid: Vec<(&crate::tasks::Task, Vec<String>, Option<String>, Vec<(crate::tasks::StepKind, String)>)> = mine
+            .tasks
+            .iter()
+            .map(|k| {
+                let open = self.task_expanded(&k.id) && !k.log.is_empty();
+                let desc = wrap(&k.desc, per, 2);
+                // Open, the steps say what it is doing; else one line does.
+                let doing = (!open && !k.doing.is_empty()).then(|| cut(&format!("› {}", k.doing), per));
+                let mut steps = Vec::new();
+                if open {
+                    for st in &k.log {
+                        let lines = match st.kind {
+                            crate::tasks::StepKind::Say => wrap(&st.text, per_log, 3),
+                            crate::tasks::StepKind::Tool => vec![cut(&format!("▸ {}", st.text), per_log)],
+                            crate::tasks::StepKind::Out => vec![cut(&st.text, per_log)],
+                        };
+                        steps.extend(lines.into_iter().map(|l| (st.kind, l)));
+                    }
+                }
+                (k, desc, doing, steps)
+            })
+            .collect();
+        let pad6 = self.px(6.0);
+        let row_h = |d: &Vec<String>, n: &Option<String>, st: &Vec<(crate::tasks::StepKind, String)>| -> f32 {
+            tag_h + (d.len() + n.is_some() as usize) as f32 * line_h + if st.is_empty() { 0.0 } else { pad6 + st.len() as f32 * log_h } + gap
+        };
+        let total: f32 = laid.iter().map(|(_, d, n, st)| row_h(d, n, st)).sum();
+        self.tk_scroll = self.tk_scroll.min((total - body.h).max(0.0));
+        self.tk_rows.clear();
+        let mut y = body.y - self.tk_scroll;
+        for (k, desc, doing, steps) in &laid {
+            let h = row_h(desc, doing, steps);
+            let top = y;
+            y += h;
+            if top + h < body.y || top > body.y + body.h {
+                continue;
+            }
+            let (y0, y1) = (top.max(body.y), (top + h - gap / 2.0).min(body.y + body.h));
+            if !k.log.is_empty() {
+                self.tk_rows.push((Rect { x: r.x, y: y0, w: r.w, h: y1 - y0 }, k.id.clone()));
+            }
+            let col = tone(k.state);
+            let d = self.px(if k.kind == Kind::Agent { 9.0 } else { 7.0 });
+            q.push(Quad {
+                rect: [x + self.px(3.5) - d / 2.0, top + tag_h / 2.0 - d / 2.0, d, d],
+                uv: if k.kind == Kind::Agent { [d / 2.0, 0.0, d / 2.0, 0.0] } else { [0.0; 4] },
+                color: if k.state == State::Running { col } else { t.surface },
+                color2: col,
+                params: [kind::RECT, 0.0, self.px(1.0).max(1.0), 0.0],
+                clip,
+                ..Default::default()
+            });
+            let kind_word = if k.kind == Kind::Agent { "AGENT" } else { "SHELL" };
+            let open_mark = if k.log.is_empty() { "" } else if steps.is_empty() { "  +" } else { "  −" };
+            let tag = match k.state {
+                State::Running => format!("{kind_word}{open_mark}"),
+                State::Done => format!("{kind_word} · DONE{open_mark}"),
+                State::Failed => format!("{kind_word} · FAILED{open_mark}"),
+                State::Stopped => format!("{kind_word} · STOPPED{open_mark}"),
+            };
+            let g = self.glyphs.text(&tag, Font::Ui, self.px(8.5), 800, self.px(1.4));
+            self.text(q, &g, tx, top + tag_h / 2.0 - g.height / 2.0, col, clip);
+            // Running: for how long. Ended: how long ago.
+            let when = match k.state {
+                State::Running if k.start_ms > 0 => span(now.saturating_sub(k.start_ms)),
+                State::Running => String::new(),
+                _ if k.end_ms > 0 => format!("{} AGO", span(now.saturating_sub(k.end_ms))),
+                _ => String::new(),
+            };
+            if !when.is_empty() {
+                let g = self.glyphs.text(&when, Font::Mono, self.px(9.0), 500, self.px(0.6));
+                self.text(q, &g, right - g.width, top + tag_h / 2.0 - g.height / 2.0, t.muted, clip);
+            }
+            let fg = if k.state == State::Running { t.fg } else { mix(t.fg, t.muted, 0.45) };
+            let mut ly = top + tag_h;
+            for line in desc {
+                let g = self.glyphs.text(line, Font::Mono, self.px(size), 400, 0.0);
+                self.text(q, &g, tx, ly + (line_h - g.height) / 2.0, fg, clip);
+                ly += line_h;
+            }
+            if let Some(d) = doing {
+                let dc = if k.state == State::Failed { with_alpha(t.alert, 0.8) } else { t.muted };
+                let g = self.glyphs.text(d, Font::Mono, self.px(10.0), 400, 0.0);
+                self.text(q, &g, tx, ly + (line_h - g.height) / 2.0, dc, clip);
+                ly += line_h;
+            }
+            if !steps.is_empty() {
+                // Its steps, oldest first, against a rule: tool calls muted,
+                // what it said brighter, output as it printed.
+                ly += self.px(3.0);
+                let sh = steps.len() as f32 * log_h;
+                self.rect(q, Rect { x: tx, y: ly, w: self.px(1.0).max(1.0), h: sh }, with_alpha(col, 0.5), 0.0, clip);
+                let last = steps.len() - 1;
+                for (j, (kind, line)) in steps.iter().enumerate() {
+                    use crate::tasks::StepKind;
+                    let c = match kind {
+                        StepKind::Say => mix(t.fg, t.muted, 0.25),
+                        StepKind::Tool if j == last && k.state == State::Running => run,
+                        StepKind::Tool => t.muted,
+                        StepKind::Out if j == last && k.state == State::Failed => t.alert,
+                        StepKind::Out => mix(t.fg, t.muted, 0.4),
+                    };
+                    let g = self.glyphs.text(line, Font::Mono, self.px(10.0), 400, 0.0);
+                    self.text(q, &g, tx + self.px(10.0), ly + (log_h - g.height) / 2.0, c, clip);
+                    ly += log_h;
+                }
+            }
+        }
+        // More above or below the part in view.
+        if self.tk_scroll > 0.5 {
+            self.label(q, "↑ MORE", Font::Mono, 8.5, 700, 1.2, right - self.px(44.0), body.y - self.px(12.0), with_alpha(t.accent2, 0.85));
+        }
+        if total - self.tk_scroll > body.h + 0.5 {
+            self.label(q, "↓ MORE", Font::Mono, 8.5, 700, 1.2, right - self.px(44.0), body.y + body.h - self.px(2.0), with_alpha(t.accent2, 0.85));
+        }
+
+        if !others.is_empty() {
+            let oy = r.y + r.h - self.px(18.0) - others_h;
+            self.rect(q, Rect { x, y: oy + self.px(6.0), w: right - x, h: self.px(1.0).max(1.0) }, t.border, 0.0, NO_CLIP);
+            self.label(q, "ELSEWHERE", Font::Ui, 9.0, 800, 2.0, x, oy + self.px(14.0), t.muted);
+            let mut y = oy + self.px(34.0);
+            for &(j, a, s) in others.iter().take(8) {
+                let p = &self.panes[j];
+                let name = if p.title.is_empty() { p.subtitle.clone() } else { super::clean_title(&p.title) };
+                let what: Vec<String> = [(a, "agent"), (s, "shell")].iter().filter(|(n, _)| *n > 0).map(|(n, w)| format!("{n} {w}{}", if *n == 1 { "" } else { "s" })).collect();
+                let what = what.join(" · ");
+                let row = Rect { x: r.x + self.px(6.0), y: y - self.px(3.0), w: r.w - self.px(12.0), h: row_o };
+                self.tk_hits.push((row, p.id));
+                let num = format!("{:02}", self.ordinal(j));
+                let nw = self.label(q, &num, Font::Mono, 10.0, 700, 0.0, x, y, t.muted);
+                let ww = self.measure(&what, Font::Mono, 10.0, 500, 0.0);
+                self.label(q, &what, Font::Mono, 10.0, 500, 0.0, right - ww, y, run);
+                let name = self.fit(&name, Font::Ui, 11.5, 600, (right - ww - self.px(10.0) - x - nw - self.px(8.0)).max(0.0));
+                self.label(q, &name, Font::Ui, 11.5, 600, 0.0, x + nw + self.px(8.0), y - self.px(1.0), t.fg);
+                y += row_o;
+            }
+        }
+    }
+
     fn fade(v: &mut f32, open: bool, dt: f32, secs: f32, animating: &mut bool) -> f32 {
         let target = if open { 1.0 } else { 0.0 };
         if (*v - target).abs() > 0.0001 {
             *v = if open { (*v + dt / secs).min(1.0) } else { (*v - dt / secs).max(0.0) };
             *animating = true;
+        }
+        // Land exactly: a fade left a hair short of closed still draws.
+        if (*v - target).abs() <= 0.0001 {
+            *v = target;
         }
         ease_out_cubic(*v)
     }
@@ -1856,6 +2105,17 @@ impl App {
 
 /// Greedy word wrap to `per` characters, at most `max` lines (the last
 /// ending in an ellipsis when cut).
+/// A duration, short: 45S, 12M, 3H, 2D.
+fn span(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s}S"),
+        60..3600 => format!("{}M", s / 60),
+        3600..172_800 => format!("{}H", s / 3600),
+        _ => format!("{}D", s / 86_400),
+    }
+}
+
 fn wrap(text: &str, per: usize, max: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();

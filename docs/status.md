@@ -7,11 +7,16 @@ cc-rail's collector does, and shows it as the card's chip and activity line:
 
 | Status | Chip | When |
 |---|---|---|
-| Blocked | `INPUT` (pulsing) | A permission prompt ("Do you want", "❯ 1. Yes") near the bottom |
+| Blocked | `INPUT` (solid red) | A permission prompt ("Do you want", "❯ 1. Yes") near the bottom |
 | Working | `RUN` + spinner | The spinner line ("… (12s", "esc to interrupt"), or its own agents or workflows running in the background |
 | Your turn | `READY` | Was working, now isn't, and you haven't typed since |
 | Idle | `IDLE` | A Claude session doing nothing |
 | Shell | none | Not a Claude session |
+
+A Blocked session's card is marked only by its solid red `INPUT` chip and its
+red "awaiting permission" line; the card itself is highlighted only when it
+is the selected session, so the two are never confused. (In the Ctrl+Shift+D
+grid, a Blocked tile still pulses red.)
 
 ## Background work
 

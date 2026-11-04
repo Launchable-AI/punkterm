@@ -3,7 +3,7 @@
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::Event;
 use alacritty_terminal::grid::Dimensions;
@@ -48,6 +48,8 @@ struct Layout {
     sections: Vec<(usize, f32)>,
     /// The conversation timeline on the right: a strip when collapsed.
     timeline: Rect,
+    /// The tasks rail, left of the timeline: a strip when collapsed.
+    tasks: Rect,
     /// Each heading's "+" button (new shell on that host), by host index.
     adds: Vec<Rect>,
     /// Each heading's resume button (recent Claude sessions on that host).
@@ -77,7 +79,16 @@ pub struct Group {
 }
 
 /// The rail's width (logical px): by default, and the range a drag keeps to.
+/// How long the panel's size must hold before tmux is told it.
+const SIZE_SETTLE_MS: u64 = 200;
+/// Smaller than this, a size is a passing sliver, never told to tmux.
+const MIN_REPORT_COLS: usize = 30;
+const MIN_REPORT_LINES: usize = 6;
+
 const RAIL_W: f32 = 292.0;
+const TASKS_W: f32 = 330.0;
+const TASKS_MIN: f32 = 240.0;
+const TASKS_MAX: f32 = 900.0;
 const RAIL_MIN: f32 = 220.0;
 const RAIL_MAX: f32 = 600.0;
 
@@ -251,6 +262,8 @@ pub struct App {
     cursor_x: Spring,
     cursor_y: Spring,
     cursor_pane: u64,
+    /// When to tell tmux punkterm's new size: once a resize has settled.
+    size_due: Option<Instant>,
     indicator: Spring,
     transition: Option<Transition>,
     last_frame: Instant,
@@ -303,6 +316,29 @@ pub struct App {
     /// The pane last fetched, when, and whether a fetch is still running.
     tl_last: Option<((usize, String), Instant)>,
     tl_busy: bool,
+    /// The tasks rail is expanded (collapsed, a strip with a count).
+    pub tasks_open: bool,
+    /// Each host's sessions' background work, by tmux pane id.
+    tasks: std::collections::HashMap<usize, crate::tasks::Host>,
+    tasks_tx: Sender<(usize, Option<crate::tasks::Host>)>,
+    tasks_rx: Receiver<(usize, Option<crate::tasks::Host>)>,
+    tasks_asked: std::collections::HashMap<usize, Instant>,
+    tasks_busy: std::collections::HashSet<usize>,
+    /// The other sessions listed in the open tasks rail, where drawn.
+    pub(super) tk_hits: Vec<(Rect, u64)>,
+    /// The open tasks rail's width, as dragged (logical px).
+    pub tasks_w: f32,
+    tasks_drag: bool,
+    tasks_pressed: Option<Instant>,
+    /// Every task shows its recent steps (else only the ones clicked open).
+    pub tasks_detail: bool,
+    /// Tasks clicked open (or shut, in the detail view), by id.
+    pub(super) tk_flipped: std::collections::HashSet<String>,
+    /// Each task's row and the DETAIL toggle, where drawn last frame.
+    pub(super) tk_rows: Vec<(Rect, String)>,
+    pub(super) tk_toggle: Rect,
+    /// How far the task list is scrolled down (px).
+    pub(super) tk_scroll: f32,
     /// Timeline scroll, in px up from the newest entry.
     pub(super) tl_scroll: f32,
     /// Where each timeline item was drawn last frame, and its kind and text.
@@ -408,6 +444,7 @@ impl App {
         let (dl_tx, dl_rx) = channel();
         let (resume_tx, resume_rx) = channel();
         let (tl_tx, tl_rx) = channel();
+        let (tasks_tx, tasks_rx) = channel();
         let mut hostnames = std::collections::HashMap::new();
         if let Ok(h) = std::fs::read_to_string("/etc/hostname") {
             hostnames.insert(0usize, h.trim().to_string());
@@ -428,6 +465,7 @@ impl App {
             cursor_x: Spring::new(0.0, 45.0),
             cursor_y: Spring::new(0.0, 45.0),
             cursor_pane: 0,
+            size_due: None,
             indicator: Spring::new(0.0, 26.0),
             transition: None,
             last_frame: Instant::now(),
@@ -466,6 +504,21 @@ impl App {
             tl_rx,
             tl_last: None,
             tl_busy: false,
+            tasks_open: false,
+            tasks: Default::default(),
+            tasks_tx,
+            tasks_rx,
+            tasks_asked: Default::default(),
+            tasks_busy: Default::default(),
+            tk_hits: Vec::new(),
+            tasks_w: TASKS_W,
+            tasks_drag: false,
+            tasks_pressed: None,
+            tasks_detail: false,
+            tk_flipped: Default::default(),
+            tk_rows: Vec::new(),
+            tk_toggle: Rect::default(),
+            tk_scroll: 0.0,
             tl_scroll: 0.0,
             tl_hits: Vec::new(),
             hover_tl: None,
@@ -535,8 +588,10 @@ impl App {
         let rail_w = self.px(self.rail_w);
         let rail = Rect { x: m, y: m, w: rail_w, h: h - 2.0 * m };
         let tl_w = if self.timeline_open { self.px(340.0) } else { self.px(30.0) };
-        let panel = Rect { x: rail.x + rail_w + m, y: m, w: (w - rail_w - tl_w - 4.0 * m).max(1.0), h: h - 2.0 * m };
-        let timeline = Rect { x: panel.x + panel.w + m, y: m, w: tl_w, h: h - 2.0 * m };
+        let tk_w = if self.tasks_open { self.px(self.tasks_w) } else { self.px(30.0) };
+        let panel = Rect { x: rail.x + rail_w + m, y: m, w: (w - rail_w - tk_w - tl_w - 5.0 * m).max(1.0), h: h - 2.0 * m };
+        let tasks = Rect { x: panel.x + panel.w + m, y: m, w: tk_w, h: h - 2.0 * m };
+        let timeline = Rect { x: tasks.x + tasks.w + m, y: m, w: tl_w, h: h - 2.0 * m };
         let header_h = self.px(50.0);
         let header = Rect { x: panel.x, y: panel.y, w: panel.w, h: header_h };
         let pad = self.px(14.0);
@@ -645,7 +700,7 @@ impl App {
         }
         sections.retain(|&(_, sy)| fits(sy - self.px(3.0), sy + self.px(14.0)));
         more.1 |= self.rail_scroll < rail_max - 0.5;
-        Layout { rail, panel, header, term, cards, sections, adds, resumes, rail_view: (view_top, view_bot), rail_more: more, rail_max, spans, heads, timeline }
+        Layout { rail, panel, header, term, cards, sections, adds, resumes, rail_view: (view_top, view_bot), rail_more: more, rail_max, spans, heads, timeline, tasks }
     }
 
     pub fn grid_size(&self) -> Size {
@@ -1058,7 +1113,7 @@ impl App {
         match tmuxcc::Conn::open(id, host, ssh.as_deref(), session, self.cc_tx.clone(), self.wake.clone()) {
             Ok(c) => {
                 let g = self.grid_size();
-                if self.report_size {
+                if self.report_size && self.size_settled() {
                     c.writer.set_size(g.cols, g.lines);
                 }
                 // Claude Code keeps images off inside tmux unless told it may
@@ -1672,7 +1727,7 @@ impl App {
         // the session itself fills punkterm's panel. Window resizes scale
         // the rail too and cc-rail does not restore it, so keep each rail
         // at the width cc-rail is set to.
-        if self.report_size {
+        if self.report_size && self.size_settled() {
             let g = self.grid_size();
             // cc-rail's default until the host's setting is read.
             let rw = self.usage.get(&host).and_then(|u| u.rail_width).unwrap_or(34);
@@ -1867,6 +1922,9 @@ impl App {
         self.saved_hosts = p.hosts.clone();
         self.removed_hosts = p.removed_hosts.clone();
         self.timeline_open = p.timeline.unwrap_or(false);
+        self.tasks_open = p.tasks.unwrap_or(false);
+        self.tasks_w = p.tasks_width.unwrap_or(TASKS_W).clamp(TASKS_MIN, TASKS_MAX);
+        self.tasks_detail = p.tasks_detail.unwrap_or(false);
         self.plan_collapsed = p.plan_collapsed.unwrap_or(false);
         self.rail_w = p.rail_width.unwrap_or(RAIL_W).clamp(RAIL_MIN, RAIL_MAX);
         self.load_collapsed = p.load_collapsed.unwrap_or(false);
@@ -1891,11 +1949,217 @@ impl App {
             hosts: self.saved_hosts.clone(),
             removed_hosts: self.removed_hosts.clone(),
             timeline: Some(self.timeline_open),
+            tasks: Some(self.tasks_open),
+            tasks_width: Some(self.tasks_w),
+            tasks_detail: Some(self.tasks_detail),
             plan_collapsed: Some(self.plan_collapsed),
             rail_width: Some(self.rail_w),
             load_collapsed: Some(self.load_collapsed),
             groups: self.groups.iter().map(|g| state::GroupPref { name: g.name.clone(), collapsed: g.collapsed, brief: g.brief, members: g.members.clone() }).collect(),
         });
+    }
+
+    /// Expand or collapse the tasks rail; the terminal takes up the rest.
+    pub fn toggle_tasks(&mut self) {
+        self.tasks_open = !self.tasks_open;
+        self.save_prefs();
+        self.resize(self.size, self.scale);
+        // Fresh numbers as it opens.
+        self.tasks_asked.clear();
+    }
+
+    pub fn tasks_at(&self, x: f32, y: f32) -> bool {
+        let r = self.layout().tasks;
+        x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h
+    }
+
+    pub fn tasks_header_at(&self, y: f32) -> bool {
+        y < self.layout().tasks.y + self.px(62.0)
+    }
+
+    /// A click in the open tasks rail: the DETAIL toggle; a task, to show
+    /// or hide its steps; another session listed, to open it. Elsewhere on
+    /// the header, close the rail.
+    pub fn tasks_click(&mut self, x: f32, y: f32) {
+        let inside = |r: &Rect| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+        if inside(&self.tk_toggle) {
+            self.tasks_detail = !self.tasks_detail;
+            self.tk_flipped.clear();
+            self.save_prefs();
+            return;
+        }
+        if self.tasks_header_at(y) {
+            self.toggle_tasks();
+            return;
+        }
+        if let Some(id) = self.tk_rows.iter().find(|(r, _)| inside(r)).map(|h| h.1.clone()) {
+            if !self.tk_flipped.remove(&id) {
+                self.tk_flipped.insert(id);
+            }
+            return;
+        }
+        let hit = self.tk_hits.iter().find(|(r, _)| inside(r)).map(|h| h.1);
+        if let Some(i) = hit.and_then(|id| self.panes.iter().position(|p| p.id == id)) {
+            self.select(i);
+            self.tk_scroll = 0.0;
+        }
+    }
+
+    /// Snapshots: the tasks rail's left edge, and the middle of task `n`'s row.
+    pub fn tasks_left(&self) -> f32 {
+        self.layout().tasks.x
+    }
+
+    pub fn task_row(&self, n: usize) -> Option<(f32, f32)> {
+        self.tk_rows.get(n).map(|(r, _)| (r.x + r.w / 2.0, r.y + r.h / 2.0))
+    }
+
+    /// Whether task `id` shows its steps.
+    pub(super) fn task_expanded(&self, id: &str) -> bool {
+        self.tasks_detail != self.tk_flipped.contains(id)
+    }
+
+    /// Wheel over the open tasks rail: `lines` > 0 scrolls up.
+    pub fn scroll_tasks(&mut self, lines: f32) {
+        self.tk_scroll = (self.tk_scroll - lines * self.px(18.0)).max(0.0);
+    }
+
+    /// The open tasks rail's left edge (and the gap beside it) under (x, y):
+    /// dragging it sets the rail's width.
+    pub fn tasks_edge_at(&self, x: f32, y: f32) -> bool {
+        if !self.tasks_open {
+            return false;
+        }
+        let r = self.layout().tasks;
+        x >= r.x - self.px(14.0) && x <= r.x + self.px(4.0) && y >= r.y && y <= r.y + r.h
+    }
+
+    /// Press on the tasks rail's edge: start dragging it (a double press
+    /// resets the width).
+    pub fn tasks_edge_press(&mut self, x: f32, y: f32) -> bool {
+        if !self.tasks_edge_at(x, y) {
+            return false;
+        }
+        if self.tasks_pressed.is_some_and(|t| t.elapsed().as_millis() < 400) {
+            self.tasks_pressed = None;
+            self.set_tasks_w(TASKS_W);
+            self.save_prefs();
+            return true;
+        }
+        self.tasks_pressed = Some(Instant::now());
+        self.tasks_drag = true;
+        true
+    }
+
+    /// Dragging the tasks rail's edge: its left side follows the pointer.
+    pub fn tasks_edge_drag(&mut self, x: f32) -> bool {
+        if !self.tasks_drag {
+            return false;
+        }
+        let r = self.layout().tasks;
+        let w = ((r.x + r.w - x) / self.scale).round();
+        self.set_tasks_w(w);
+        true
+    }
+
+    pub fn tasks_edge_release(&mut self) -> bool {
+        if std::mem::take(&mut self.tasks_drag) {
+            self.save_prefs();
+            return true;
+        }
+        false
+    }
+
+    fn set_tasks_w(&mut self, w: f32) {
+        // Never so wide the terminal panel goes under a useful width.
+        let timeline = if self.timeline_open { 340.0 } else { 30.0 };
+        let room = (self.size.0 as f32 / self.scale - self.rail_w - timeline - 5.0 * 14.0 - 560.0).max(TASKS_MIN);
+        let w = w.clamp(TASKS_MIN, TASKS_MAX.min(room));
+        if (w - self.tasks_w).abs() >= 1.0 {
+            self.tasks_w = w;
+            let (size, scale) = (self.size, self.scale);
+            self.resize(size, scale);
+        }
+    }
+
+    /// Pane `i`'s background work, if it is a Claude session on tmux.
+    pub(super) fn tasks_of(&self, i: usize) -> Option<&crate::tasks::Session> {
+        let p = self.panes.get(i)?;
+        // A plain pane only has some in snapshots (keyed by its id).
+        let key = p.tmux_pane.clone().unwrap_or_else(|| format!("#{}", p.id));
+        self.tasks.get(&p.host)?.get(&key)
+    }
+
+    /// Re-read every connected host's background work: every few seconds
+    /// while the rail is open, now and then while it is a strip.
+    fn poll_tasks(&mut self) {
+        let every = if self.tasks_open { 4 } else { 20 };
+        for h in 0..self.hosts.len() {
+            let up = if h == 0 { self.conns.iter().any(|c| c.host == 0) } else { self.host_state.get(h) == Some(&HostState::Up) };
+            if !up || self.tasks_busy.contains(&h) || self.tasks_asked.get(&h).is_some_and(|t| t.elapsed().as_secs() < every) {
+                continue;
+            }
+            self.tasks_busy.insert(h);
+            self.tasks_asked.insert(h, Instant::now());
+            let ssh = self.hosts[h].ssh.clone();
+            let (tx, wake) = (self.tasks_tx.clone(), self.wake.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send((h, crate::tasks::fetch(ssh.as_deref())));
+                wake();
+            });
+        }
+    }
+
+    /// Snapshots: made-up background work for the active session and one
+    /// other.
+    pub fn fake_tasks(&mut self) {
+        use crate::tasks::{Kind, Session, State, Task};
+        let now = crate::usage::now_ms();
+        use crate::tasks::{Step, StepKind};
+        let step = |kind, text: &str| Step { kind, at_ms: if kind == StepKind::Out { 0 } else { now - 30_000 }, text: text.into() };
+        let task = |kind, state, ago_s: u64, took_s: u64, desc: &str, doing: &str| Task {
+            log: if kind == Kind::Agent {
+                vec![
+                    step(StepKind::Say, "Reading the eval harness first, then I'll run all three arms on the same cases."),
+                    step(StepKind::Tool, "Read judge.py"),
+                    step(StepKind::Tool, "Grep def score"),
+                    step(StepKind::Tool, "Bash python3 judge.py cases.json --arms 3"),
+                    step(StepKind::Say, "Arm B wins 14 of 19 so far; waiting on the last five."),
+                    step(StepKind::Tool, doing),
+                ]
+            } else if doing.is_empty() {
+                Vec::new()
+            } else {
+                vec![step(StepKind::Out, "> app@1.0.0 verify"), step(StepKind::Out, "> vitest run && npm run build"), step(StepKind::Out, " ✓ src/pipeline/run-chat.test.ts (212)"), step(StepKind::Out, doing)]
+            },
+            kind,
+            id: desc.chars().take(6).collect(),
+            state,
+            start_ms: now - ago_s * 1000,
+            end_ms: if state == State::Running { 0 } else { now - (ago_s - took_s) * 1000 },
+            desc: desc.into(),
+            doing: doing.into(),
+        };
+        let mine = Session {
+            session_id: "s1".into(),
+            tasks: vec![
+                task(Kind::Agent, State::Running, 260, 0, "Evaluate the router options against the eval set", "Bash python3 judge.py cases.json --arms 3"),
+                task(Kind::Agent, State::Running, 95, 0, "Find every caller of the old cache API", "Grep invalidate_cache"),
+                task(Kind::Shell, State::Running, 610, 0, "Run full verify in background", "✓ 412 passed · 3 skipped (31.2s) · building app…"),
+                task(Kind::Shell, State::Running, 172_800, 0, "Wait for pairwise judging and tally verdicts", ""),
+                task(Kind::Shell, State::Done, 900, 120, "Install dependencies in worktree", "added 812 packages in 41s"),
+                task(Kind::Shell, State::Failed, 1500, 40, "Start local runtime with tiered variant", "Error: listen EADDRINUSE :::3917"),
+                task(Kind::Agent, State::Stopped, 1700, 300, "Verify the provider pricing", ""),
+            ],
+        };
+        let other = Session { session_id: "s2".into(), tasks: vec![task(Kind::Agent, State::Running, 40, 0, "Draft the migration", "Edit schema.sql"), task(Kind::Shell, State::Running, 30, 0, "Deploy to sandbox", "pushing image…")] };
+        let mut host = crate::tasks::Host::new();
+        for (k, i) in [self.active, (self.active + 1) % self.panes.len().max(1)].into_iter().enumerate() {
+            let Some(p) = self.panes.get(i).filter(|_| k == 0 || i != self.active) else { continue };
+            let pane = p.tmux_pane.clone().unwrap_or_else(|| format!("#{}", p.id));
+            host.insert(pane, if k == 0 { mine.clone() } else { other.clone() });
+        }
+        self.tasks.insert(self.panes.get(self.active).map_or(0, |p| p.host), host);
     }
 
     /// Expand or collapse the timeline rail; the terminal takes up the rest.
@@ -2842,18 +3106,47 @@ impl App {
         for p in &mut self.panes {
             p.resize(g);
         }
-        // Tell tmux how big punkterm is, as any attached terminal would:
-        // with tmux's default `window-size latest`, windows fit punkterm
-        // while it is the client in use, and kitty's size when kitty is.
-        for c in self.conns.iter().filter(|_| self.report_size) {
+        // tmux hears the size once it settles (see `report_tmux_size`).
+        self.size_due = Some(Instant::now() + Duration::from_millis(SIZE_SETTLE_MS));
+    }
+
+    /// The panel's size is one tmux should be given: not mid-resize, and
+    /// not one of the slivers a window passes through while being dragged
+    /// or (un)maximized. Every size tmux hears, Claude Code redraws its
+    /// whole transcript at, hard-wrapped, into the scrollback.
+    fn size_settled(&self) -> bool {
+        let g = self.grid_size();
+        self.size_due.is_none() && g.cols >= MIN_REPORT_COLS && g.lines >= MIN_REPORT_LINES
+    }
+
+    /// Tell tmux how big punkterm is, as any attached terminal would: with
+    /// tmux's default `window-size latest`, windows fit punkterm while it is
+    /// the client in use, and kitty's size when kitty is.
+    fn report_tmux_size(&mut self) {
+        if self.size_due.is_some_and(|t| Instant::now() >= t) {
+            self.size_due = None;
+        }
+        if !self.report_size || !self.size_settled() {
+            return;
+        }
+        let g = self.grid_size();
+        for c in &self.conns {
             c.writer.set_size(g.cols, g.lines);
             c.writer.list_panes();
         }
     }
 
+    /// A resize is waiting to settle (keep frames coming until it does).
+    pub fn size_pending(&self) -> bool {
+        self.size_due.is_some()
+    }
+
     /// Apply terminal events. Returns true if anything needs redrawing.
     pub fn pump(&mut self) -> bool {
         let mut dirty = false;
+        if self.size_due.is_some() {
+            self.report_tmux_size();
+        }
         while let Ok((id, ev)) = self.rx.try_recv() {
             dirty = true;
             let Some(i) = self.panes.iter().position(|p| p.id == id) else { continue };
@@ -2977,6 +3270,18 @@ impl App {
             }
         }
         self.poll_timeline();
+        if self.persist {
+            self.poll_tasks();
+        }
+        while let Ok((h, t)) = self.tasks_rx.try_recv() {
+            self.tasks_busy.remove(&h);
+            if let Some(t) = t {
+                if self.tasks.get(&h) != Some(&t) {
+                    dirty = true;
+                }
+                self.tasks.insert(h, t);
+            }
+        }
         while let Ok((key, t)) = self.tl_rx.try_recv() {
             self.tl_busy = false;
             match t {

@@ -44,6 +44,16 @@ width cc-rail is set to (`~/.cc-rail/state/ui.json`, else 34) and given that
 width straight back after each window resize, since tmux spreads a resize
 over every pane.
 
+## Window resizes
+
+punkterm tells tmux its size (`refresh-client -C`) only once a resize has
+held for 200 ms, and never a size under 30×6. Claude Code redraws its whole
+transcript, hard-wrapped, at every width it is given, so a window passing
+through a sliver while it is dragged or (un)maximized would otherwise leave
+a column of squashed text in the scrollback that no later resize can
+unwrap. The panel itself follows the window at once; only tmux waits.
+This can't fix scrollback that is already squashed.
+
 ## In the rail
 
 Each pane of a split window keeps its own card, and the cards of one window

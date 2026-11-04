@@ -27,6 +27,12 @@ alongside it: punkterm never edits your tmux, shell or terminal configs.
   the active session's prompts, Claude's replies and its tool calls, read from
   the session's transcript on its host. Click an entry to scroll the terminal
   back to it.
+- **Background tasks.** A second right rail (**Ctrl+Shift+K**) shows what the
+  active session's sub-agents and background shells are doing: each one's
+  description, its last tool call or line of output, and whether it is
+  running, done or failed; click one (or toggle DETAIL) for its live steps
+  or output; plus the other sessions with work running. Drag its edge to
+  widen it (see [docs/tasks.md](docs/tasks.md)).
 - **Dashboard.** **Ctrl+Shift+D** shows every session as a live tile.
 - **Inline images.** Images Claude Code draws with the kitty graphics protocol
   show in place, through tmux and over ssh (see [docs/images.md](docs/images.md));
@@ -89,6 +95,7 @@ Remote hosts need tmux; the Claude features also need `python3`.
 | Ctrl+Shift+Space | Next session that needs you |
 | Ctrl+Shift+D | Dashboard |
 | Ctrl+Shift+H | Conversation timeline |
+| Ctrl+Shift+K | Background tasks: agents and shells |
 | Ctrl+Shift+U | Plan usage for every account on your hosts |
 | ↺ beside a host | Resume one of its recent Claude sessions (type to search them) |
 | Right-click a host's heading | Disconnect, connect or remove that host |
@@ -115,11 +122,11 @@ theme. The choice is remembered.
 | Path | What |
 |---|---|
 | `~/.config/punkterm/config.toml` | Hosts (optional; punkterm never writes it) |
-| `~/.local/state/punkterm/state.toml` | Theme, opacity, sound, saved hosts, timeline open |
+| `~/.local/state/punkterm/state.toml` | Theme, opacity, sound, saved hosts, timeline and tasks rails open |
 | `~/.cache/punkterm/` | ssh control sockets, generated sounds |
 
 More detail in [docs/](docs): [hosts](docs/hosts.md), [status](docs/status.md),
-[scrollback](docs/scrollback.md), [splits](docs/splits.md),
+[scrollback](docs/scrollback.md), [splits](docs/splits.md), [tasks](docs/tasks.md),
 [links](docs/links.md), [themes](docs/themes.md).
 
 ## License

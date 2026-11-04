@@ -14,6 +14,12 @@ pub struct Prefs {
     pub removed_hosts: Vec<String>,
     /// The timeline rail is expanded.
     pub timeline: Option<bool>,
+    /// The tasks rail is expanded.
+    pub tasks: Option<bool>,
+    /// The tasks rail's width, as dragged (logical px).
+    pub tasks_width: Option<f32>,
+    /// The tasks rail shows every task's steps.
+    pub tasks_detail: Option<bool>,
     /// The rail footer's PLAN and LOAD panels are folded to a line each.
     pub plan_collapsed: Option<bool>,
     pub load_collapsed: Option<bool>,
@@ -52,6 +58,9 @@ pub fn load() -> Prefs {
             .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|h| h.as_str().map(str::to_string)).collect()))
             .unwrap_or_default(),
         timeline: get("timeline").and_then(|v| v.as_bool()),
+        tasks: get("tasks").and_then(|v| v.as_bool()),
+        tasks_width: get("tasks_width").and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64))).map(|f| f as f32),
+        tasks_detail: get("tasks_detail").and_then(|v| v.as_bool()),
         plan_collapsed: get("plan_collapsed").and_then(|v| v.as_bool()),
         load_collapsed: get("load_collapsed").and_then(|v| v.as_bool()),
         rail_width: get("rail_width").and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64))).map(|f| f as f32),
@@ -95,6 +104,15 @@ pub fn save(p: &Prefs) {
     }
     if let Some(v) = p.timeline {
         t.insert("timeline".into(), v.into());
+    }
+    if let Some(v) = p.tasks {
+        t.insert("tasks".into(), v.into());
+    }
+    if let Some(v) = p.tasks_width {
+        t.insert("tasks_width".into(), (v as f64).into());
+    }
+    if let Some(v) = p.tasks_detail {
+        t.insert("tasks_detail".into(), v.into());
     }
     if let Some(v) = p.rail_width {
         t.insert("rail_width".into(), (v as f64).into());

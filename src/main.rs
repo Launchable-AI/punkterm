@@ -12,6 +12,7 @@ mod term;
 mod sound;
 mod state;
 mod sysstat;
+mod tasks;
 mod timeline;
 mod theme;
 mod tmuxcc;
@@ -548,6 +549,10 @@ impl ApplicationHandler for Win {
                             app.toggle_timeline();
                             true
                         }
+                        Some(KeyCode::KeyK) => {
+                            app.toggle_tasks();
+                            true
+                        }
                         Some(KeyCode::KeyU) => {
                             app.toggle_usage();
                             true
@@ -625,7 +630,7 @@ impl ApplicationHandler for Win {
                     }
                     return;
                 }
-                if app.rail_edge_drag(position.x as f32) {
+                if app.rail_edge_drag(position.x as f32) || app.tasks_edge_drag(position.x as f32) {
                     gpu.window.request_redraw();
                     return;
                 }
@@ -637,7 +642,8 @@ impl ApplicationHandler for Win {
                 let over = app
                     .divider_at(position.x as f32, position.y as f32)
                     .map(|(_, v)| v)
-                    .or_else(|| app.rail_edge_at(position.x as f32, position.y as f32).then_some(true));
+                    .or_else(|| app.rail_edge_at(position.x as f32, position.y as f32).then_some(true))
+                    .or_else(|| app.tasks_edge_at(position.x as f32, position.y as f32).then_some(true));
                 if over != app.divider_hover {
                     app.divider_hover = over;
                     gpu.window.set_cursor(match over {
@@ -667,7 +673,7 @@ impl ApplicationHandler for Win {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
-                if app.divider_release() | app.rail_edge_release() {
+                if app.divider_release() | app.rail_edge_release() | app.tasks_edge_release() {
                     gpu.window.request_redraw();
                 }
                 if app.card_drop(self.mouse.0 as f32, self.mouse.1 as f32) {
@@ -711,7 +717,7 @@ impl ApplicationHandler for Win {
                 } else if app.resume.is_some() {
                     app.resume_click(mx, my);
                     gpu.window.request_redraw();
-                } else if !app.help && !app.overview && !app.usage_open && app.rail_edge_press(mx, my) {
+                } else if !app.help && !app.overview && !app.usage_open && (app.rail_edge_press(mx, my) || app.tasks_edge_press(mx, my)) {
                     gpu.window.request_redraw();
                 } else if app.usage_open {
                     app.toggle_usage();
@@ -721,6 +727,15 @@ impl ApplicationHandler for Win {
                 } else if app.overview {
                     if let Some(i) = app.overview_tile_at(mx, my) {
                         app.overview_open(i);
+                    }
+                    gpu.window.request_redraw();
+                } else if app.tasks_at(mx, my) {
+                    // The collapsed strip opens it; clicks in the open rail
+                    // (its header closes it) go to `tasks_click`.
+                    if !app.tasks_open {
+                        app.toggle_tasks();
+                    } else {
+                        app.tasks_click(mx, my);
                     }
                     gpu.window.request_redraw();
                 } else if app.timeline_at(mx, my) {
@@ -770,6 +785,8 @@ impl ApplicationHandler for Win {
                     app.resume_step(if lines > 0.0 { -1 } else { 1 });
                 } else if app.rail_list_at(self.mouse.0 as f32, self.mouse.1 as f32) {
                     app.scroll_rail(lines);
+                } else if app.tasks_open && app.tasks_at(self.mouse.0 as f32, self.mouse.1 as f32) {
+                    app.scroll_tasks(lines);
                 } else if app.timeline_open && app.timeline_at(self.mouse.0 as f32, self.mouse.1 as f32) {
                     app.scroll_timeline(lines);
                 } else {
@@ -992,6 +1009,31 @@ fn snapshot(theme: Theme, args: &Args, path: &str) {
             app.new_session(0);
             step(&mut app, 3000);
             println!("after new: {} panes, local {:?}", app.panes.len(), app.host_state.first());
+        }
+        // "tasks[:closed|:detail|:open1][:dragX]": the tasks rail with
+        // made-up background work; all tasks' steps shown, or the first's;
+        // its edge dragged to x = X.
+        Some(s) if s.starts_with("tasks") => {
+            let opts: Vec<&str> = s.split(':').skip(1).collect();
+            app.tasks_open = !opts.contains(&"closed");
+            app.tasks_detail = opts.contains(&"detail");
+            app.fake_tasks();
+            app.resize(app.size, app.scale);
+            step(&mut app, 300);
+            if let Some(x) = opts.iter().find_map(|o| o.strip_prefix("drag").and_then(|x| x.parse::<f32>().ok())) {
+                let r = app.tasks_left();
+                app.tasks_edge_press(r - 4.0, 300.0);
+                app.tasks_edge_drag(x);
+                app.tasks_edge_release();
+                println!("tasks width: {}", app.tasks_w);
+            }
+            if opts.contains(&"open1") {
+                step(&mut app, 100);
+                if let Some(r) = app.task_row(0) {
+                    app.tasks_click(r.0, r.1);
+                }
+            }
+            step(&mut app, 500);
         }
         Some(s) if s.starts_with("timeline") => {
             // Not toggle_timeline: a snapshot must not save prefs.

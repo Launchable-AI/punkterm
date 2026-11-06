@@ -78,13 +78,15 @@ pub struct Group {
     pub members: Vec<String>,
 }
 
-/// The rail's width (logical px): by default, and the range a drag keeps to.
 /// How long the panel's size must hold before tmux is told it.
-const SIZE_SETTLE_MS: u64 = 200;
+const SIZE_SETTLE_MS: u64 = 800;
+/// How long a window is on screen before it is fitted to the panel.
+const SHOW_SETTLE_MS: u64 = 400;
 /// Smaller than this, a size is a passing sliver, never told to tmux.
 const MIN_REPORT_COLS: usize = 30;
 const MIN_REPORT_LINES: usize = 6;
 
+/// The rail's width (logical px): by default, and the range a drag keeps to.
 const RAIL_W: f32 = 292.0;
 const TASKS_W: f32 = 330.0;
 const TASKS_MIN: f32 = 240.0;
@@ -296,9 +298,15 @@ pub struct App {
     host_sys_tx: Sender<(usize, Option<crate::sysstat::Load>)>,
     host_sys_rx: Receiver<(usize, Option<crate::sysstat::Load>)>,
     host_sys_asked: Option<Instant>,
-    /// Pasted images copied to a host: (pane id, the path there, or why not).
-    paste_tx: Sender<(u64, Result<String, String>)>,
-    paste_rx: Receiver<(u64, Result<String, String>)>,
+    /// Pasted images and uploaded files copied to a host: (pane id, what
+    /// it was for toasts, the text to paste there, or why not).
+    paste_tx: Sender<(u64, String, Result<String, String>)>,
+    paste_rx: Receiver<(u64, String, Result<String, String>)>,
+    /// Files picked for upload: (pane id, the picks, or why there was no picker).
+    pick_tx: Sender<(u64, Result<Vec<std::path::PathBuf>, String>)>,
+    pick_rx: Receiver<(u64, Result<Vec<std::path::PathBuf>, String>)>,
+    /// The header's UPLOAD button, where it was last drawn.
+    pub(crate) upload_btn: Option<Rect>,
     /// Image files read for panes (images sent by path): pane id, the
     /// request, the bytes.
     img_tx: Sender<(u64, crate::graphics::FileRequest, Option<Vec<u8>>)>,
@@ -440,6 +448,7 @@ impl App {
         let (usage_tx, usage_rx) = channel();
         let (host_sys_tx, host_sys_rx) = channel();
         let (paste_tx, paste_rx) = channel();
+        let (pick_tx, pick_rx) = channel();
         let (img_tx, img_rx) = channel();
         let (dl_tx, dl_rx) = channel();
         let (resume_tx, resume_rx) = channel();
@@ -493,6 +502,9 @@ impl App {
             host_sys_asked: None,
             paste_tx,
             paste_rx,
+            pick_tx,
+            pick_rx,
+            upload_btn: None,
             img_tx,
             img_rx,
             dl_tx,
@@ -1103,6 +1115,16 @@ impl App {
         }
     }
 
+    /// `new-window` (with `args`), sized to the panel from the start: tmux
+    /// would make it its default 80×24 (punkterm tells it no client size),
+    /// and what starts there would reprint once it was fitted.
+    fn new_window(&self, w: &tmuxcc::Writer, args: &str) {
+        let g = self.grid_size();
+        w.command(tmuxcc::Want::Ignore, &format!("new-window{args}"));
+        // Without -t: the session's current window, which is the new one.
+        w.command(tmuxcc::Want::Ignore, &format!("resize-window -x {} -y {}", g.cols.max(MIN_REPORT_COLS), g.lines.max(MIN_REPORT_LINES)));
+    }
+
     fn open_conn(&mut self, host: usize, session: &str) {
         if self.conns.iter().any(|c| c.host == host && c.session == session) {
             return;
@@ -1112,10 +1134,6 @@ impl App {
         self.next_id += 1;
         match tmuxcc::Conn::open(id, host, ssh.as_deref(), session, self.cc_tx.clone(), self.wake.clone()) {
             Ok(c) => {
-                let g = self.grid_size();
-                if self.report_size && self.size_settled() {
-                    c.writer.set_size(g.cols, g.lines);
-                }
                 // Claude Code keeps images off inside tmux unless told it may
                 // draw them: punkterm reads them from the raw pane output.
                 // Claude sessions started after this get the variable.
@@ -1142,7 +1160,7 @@ impl App {
             .map(|c| (c.id, c.writer.clone()));
         if let Some((id, w)) = conn {
             self.focus_new = Some(id);
-            w.command(tmuxcc::Want::Ignore, "new-window");
+            self.new_window(&w, "");
             return;
         }
         if h.ssh.is_none() && !tmux_installed() {
@@ -1482,26 +1500,79 @@ impl App {
                 let (tx, wake) = (self.paste_tx.clone(), self.wake.clone());
                 std::thread::spawn(move || {
                     let path = format!("/tmp/punkterm-paste/{name}");
-                    let cmd = format!("mkdir -p /tmp/punkterm-paste && cat > {path}");
-                    let ok = std::process::Command::new("ssh")
-                        .args(crate::tmuxcc::ssh_args(&spec))
-                        .arg(cmd)
-                        .stdin(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                        .and_then(|mut c| {
-                            use std::io::Write;
-                            c.stdin.take().map(|mut s| s.write_all(&bytes)).transpose()?;
-                            c.wait()
-                        })
-                        .is_ok_and(|s| s.success());
-                    let _ = tx.send((id, if ok { Ok(path) } else { Err("copy to host failed".into()) }));
+                    let r = crate::upload::ssh_write(&spec, &path, &bytes[..]).map(|_| path);
+                    let _ = tx.send((id, "IMAGE".into(), r));
                     wake();
                 });
             }
         }
         true
+    }
+
+    /// Send a local file into pane `id`'s session: its path is pasted as an
+    /// `@` mention for Claude (a bare path for an image, which Claude
+    /// attaches), or quoted for a shell. On a remote host the file is first
+    /// copied to `/tmp/punkterm-upload/<time>/<name>` over ssh. Locally a
+    /// path that would need quoting is copied to the temp dir the same way.
+    pub fn upload_file(&mut self, id: u64, path: &std::path::Path) {
+        use crate::upload;
+        let Some(i) = self.panes.iter().position(|p| p.id == id) else { return };
+        let name = upload::file_name(path);
+        let shown = truncate(&name, 40).to_uppercase();
+        match std::fs::metadata(path) {
+            Ok(m) if m.is_dir() => return self.toast(format!("UPLOAD // {shown} IS A FOLDER")),
+            Ok(_) => {}
+            Err(_) => return self.toast(format!("UPLOAD // CAN'T READ {shown}")),
+        }
+        let claude = self.ui.get(i).is_some_and(|u| u.status != Status::Shell);
+        let image = upload::is_image(&name);
+        let sub = format!("{}/{}", crate::usage::now_ms(), upload::safe_name(&name));
+        match self.hosts.get(self.panes[i].host).and_then(|h| h.ssh.clone()) {
+            None => {
+                let local = path.to_string_lossy().into_owned();
+                let target = if !claude || upload::plain_path(&local) {
+                    local
+                } else {
+                    let dst = std::env::temp_dir().join("punkterm-upload").join(&sub);
+                    let ok = dst.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::fs::copy(path, &dst).is_ok();
+                    if !ok {
+                        return self.toast(format!("UPLOAD // COULD NOT COPY {shown}"));
+                    }
+                    dst.to_string_lossy().into_owned()
+                };
+                self.paste_text(i, &upload::mention(&target, claude, image));
+                self.toast(format!("UPLOAD // {shown} ADDED"));
+            }
+            Some(spec) => {
+                let Ok(file) = std::fs::File::open(path) else {
+                    return self.toast(format!("UPLOAD // CAN'T READ {shown}"));
+                };
+                self.toast(format!("UPLOAD // SENDING {shown}…"));
+                let (tx, wake) = (self.paste_tx.clone(), self.wake.clone());
+                std::thread::spawn(move || {
+                    let remote = format!("{}/{sub}", upload::REMOTE_DIR);
+                    let r = upload::ssh_write(&spec, &remote, std::io::BufReader::new(file)).map(|_| upload::mention(&remote, claude, image));
+                    let _ = tx.send((id, shown, r));
+                    wake();
+                });
+            }
+        }
+    }
+
+    /// The UPLOAD button / Ctrl+Shift+F: pick files to send to the active
+    /// session, with the desktop's file picker.
+    pub fn open_upload(&mut self) {
+        let Some(p) = self.panes.get(self.active) else { return };
+        let (id, tx, wake) = (p.id, self.pick_tx.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((id, crate::upload::pick_files()));
+            wake();
+        });
+    }
+
+    /// Clicked the header's UPLOAD button.
+    pub fn upload_btn_at(&self, x: f32, y: f32) -> bool {
+        self.upload_btn.is_some_and(|r| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)
     }
 
     /// Mark the active pane to join elsewhere, or clear the mark.
@@ -1722,49 +1793,45 @@ impl App {
         let Some(c) = self.conns.iter().find(|c| c.id == conn) else { return };
         let (host, writer) = (c.host, c.writer.clone());
         let all: Vec<tmuxcc::PaneInfo> = lines.iter().filter_map(|l| tmuxcc::parse_pane(l)).collect();
+        // Fit the window on screen to the panel, and no other: each resize
+        // makes Claude Code reprint its transcript at the new width, so
+        // hidden windows keep their size until they are shown (see
+        // `Writer::resize_window`). Only while this punkterm has focus, so
+        // two punkterms showing one window don't take turns resizing it.
+        //
         // cc-rail's rail sits beside a session in the same window, and
-        // punkterm does not show it: make such windows wider by the rail, so
-        // the session itself fills punkterm's panel. Window resizes scale
-        // the rail too and cc-rail does not restore it, so keep each rail
-        // at the width cc-rail is set to.
-        if self.report_size && self.size_settled() {
+        // punkterm does not show it: such a window is wider by the rail, so
+        // the session itself fills the panel, and the rail is held at the
+        // width cc-rail is set to (a window resize scales it too).
+        let shown_window = self.panes.get(self.active).filter(|p| p.conn == Some(conn)).and_then(|p| p.window.clone());
+        if let (true, Some(sw)) = (self.report_size && self.focused && self.size_settled(), shown_window) {
             let g = self.grid_size();
             // cc-rail's default until the host's setting is read.
             let rw = self.usage.get(&host).and_then(|u| u.rail_width).unwrap_or(34);
-            // Panes side by side next to a window's rails: each needs
+            let panes: Vec<&tmuxcc::PaneInfo> = all.iter().filter(|p| p.window_id == sw).collect();
+            let shown: Vec<&&tmuxcc::PaneInfo> = panes.iter().filter(|p| !p.rail).collect();
+            // Panes side by side next to the window's rails: each needs
             // MIN_COLS, or holding a rail at width in a narrow window
             // squeezes its neighbours to a column.
-            let beside = |w: &str| all.iter().filter(|p| p.window_id == w && !p.rail).map(|p| p.pos.0).collect::<std::collections::BTreeSet<_>>().len().max(1);
-            for r in all.iter().filter(|p| p.rail) {
-                if r.window_size.0 >= rw + 1 + MIN_COLS * beside(&r.window_id) {
-                    writer.pin_width(&r.id, rw, r.cols);
-                }
-            }
-            let mut windows: Vec<&str> = all.iter().map(|p| p.window_id.as_str()).collect();
-            windows.dedup();
-            for w in windows {
-                let panes: Vec<&tmuxcc::PaneInfo> = all.iter().filter(|p| p.window_id == w).collect();
-                let shown: Vec<&&tmuxcc::PaneInfo> = panes.iter().filter(|p| !p.rail).collect();
-                let (Some(p), true) = (shown.first(), panes.len() > shown.len()) else { continue };
+            let beside = shown.iter().map(|p| p.pos.0).collect::<std::collections::BTreeSet<_>>().len().max(1);
+            if let Some(p) = shown.first() {
                 let (ww, wh) = p.window_size;
-                if ww == 0 {
-                    continue;
-                }
                 // The shown panes' extent: one pane, or a split window's.
-                let left = shown.iter().map(|p| p.pos.0).min().unwrap_or(0);
                 let top = shown.iter().map(|p| p.pos.1).min().unwrap_or(0);
-                let cols = shown.iter().map(|p| p.pos.0 + p.cols).max().unwrap_or(0) - left;
                 let lines = shown.iter().map(|p| p.pos.1 + p.lines).max().unwrap_or(0) - top;
                 let extra_w = (panes.len() - shown.len()) * (rw + 1);
-                if cols.abs_diff(g.cols) > 1 || lines.abs_diff(g.lines) > 1 || ww != g.cols + extra_w {
-                    if writer.set_window_size(w, g.cols + extra_w, g.lines + wh.saturating_sub(lines)) {
-                        // tmux spreads a resize over every pane; give the
-                        // rails their width straight back.
-                        if g.cols >= MIN_COLS * beside(w) {
-                            for r in panes.iter().filter(|p| p.rail) {
-                                writer.command(tmuxcc::Want::Ignore, &format!("resize-pane -t {} -x {rw}", r.id));
-                            }
+                let want = (g.cols + extra_w, g.lines + wh.saturating_sub(lines));
+                if ww > 0 && writer.resize_window(&sw, (ww, wh), want) {
+                    // tmux spreads a resize over every pane; give the
+                    // rails their width straight back.
+                    if g.cols >= MIN_COLS * beside {
+                        for r in panes.iter().filter(|p| p.rail) {
+                            writer.command(tmuxcc::Want::Ignore, &format!("resize-pane -t {} -x {rw}", r.id));
                         }
+                    }
+                } else if ww >= rw + 1 + MIN_COLS * beside {
+                    for r in panes.iter().filter(|p| p.rail) {
+                        writer.pin_width(&r.id, rw, r.cols);
                     }
                 }
             }
@@ -2470,6 +2537,9 @@ impl App {
         }
         self.active = i;
         self.ui[i].unseen = false;
+        if !same_view {
+            self.fit_soon();
+        }
     }
 
     pub fn cycle(&mut self, d: isize) {
@@ -2617,11 +2687,7 @@ impl App {
             Some((id, w)) => {
                 self.focus_new = Some(id);
                 let dir = r.cwd.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$");
-                if dir.is_empty() {
-                    w.command(tmuxcc::Want::Ignore, "new-window");
-                } else {
-                    w.command(tmuxcc::Want::Ignore, &format!("new-window -c \"{dir}\""));
-                }
+                self.new_window(&w, &if dir.is_empty() { String::new() } else { format!(" -c \"{dir}\"") });
                 let hex: Vec<String> = format!("{cmd}\r").bytes().map(|b| format!("{b:02x}")).collect();
                 w.command(tmuxcc::Want::Ignore, &format!("send-keys -H {}", hex.join(" ")));
             }
@@ -3119,9 +3185,9 @@ impl App {
         self.size_due.is_none() && g.cols >= MIN_REPORT_COLS && g.lines >= MIN_REPORT_LINES
     }
 
-    /// Tell tmux how big punkterm is, as any attached terminal would: with
-    /// tmux's default `window-size latest`, windows fit punkterm while it is
-    /// the client in use, and kitty's size when kitty is.
+    /// Once the panel's size has settled, fit the window on screen to it
+    /// (through a fresh pane listing; see `sync_panes`). tmux never hears a
+    /// client size from punkterm.
     fn report_tmux_size(&mut self) {
         if self.size_due.is_some_and(|t| Instant::now() >= t) {
             self.size_due = None;
@@ -3129,11 +3195,19 @@ impl App {
         if !self.report_size || !self.size_settled() {
             return;
         }
-        let g = self.grid_size();
-        for c in &self.conns {
-            c.writer.set_size(g.cols, g.lines);
+        // A fresh listing fits the shown window (see `sync_panes`).
+        let conn = self.panes.get(self.active).and_then(|p| p.conn);
+        if let Some(c) = self.conns.iter().find(|c| Some(c.id) == conn) {
             c.writer.list_panes();
         }
+    }
+
+    /// A window just came on screen (or punkterm got focus): fit it to the
+    /// panel once it has been shown a moment, so stepping through sessions
+    /// doesn't resize every one passed on the way.
+    pub fn fit_soon(&mut self) {
+        let at = Instant::now() + Duration::from_millis(SHOW_SETTLE_MS);
+        self.size_due = Some(self.size_due.map_or(at, |t| t.max(at)));
     }
 
     /// A resize is waiting to settle (keep frames coming until it does).
@@ -3236,16 +3310,25 @@ impl App {
             }
             dirty = true;
         }
-        // Images pasted to a remote host: paste their path once copied there.
-        while let Ok((id, r)) = self.paste_rx.try_recv() {
+        // Images pasted and files uploaded to a remote host: paste their
+        // path once copied there.
+        while let Ok((id, what, r)) = self.paste_rx.try_recv() {
             match r {
-                Ok(path) => {
+                Ok(text) => {
                     if let Some(i) = self.panes.iter().position(|p| p.id == id) {
-                        self.paste_text(i, &path);
-                        self.toast("IMAGE // PASTED");
+                        self.paste_text(i, &text);
+                        self.toast(format!("{what} // {}", if what == "IMAGE" { "PASTED" } else { "ADDED" }));
                     }
                 }
-                Err(e) => self.toast(format!("IMAGE // {}", e.to_uppercase())),
+                Err(e) => self.toast(format!("{what} // {}", e.to_uppercase())),
+            }
+            dirty = true;
+        }
+        // Files picked for upload.
+        while let Ok((id, r)) = self.pick_rx.try_recv() {
+            match r {
+                Ok(paths) => paths.iter().for_each(|p| self.upload_file(id, p)),
+                Err(e) => self.toast(format!("UPLOAD // {}", e.to_uppercase())),
             }
             dirty = true;
         }

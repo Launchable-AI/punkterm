@@ -11,6 +11,9 @@ and what each one has been up to.
 punkterm hooks into tmux rather than replacing it. Sessions keep running
 when punkterm closes, and your usual terminal and tmux setup keep working
 alongside it: punkterm never edits your tmux, shell or terminal configs.
+It resizes only the tmux window on screen, so Claude sessions you aren't
+looking at never get squashed, even with punkterm open on two machines with
+different screens ([docs/splits.md](docs/splits.md#window-sizes)).
 
 ## Features
 
@@ -38,6 +41,10 @@ alongside it: punkterm never edits your tmux, shell or terminal configs.
   show in place, through tmux and over ssh (see [docs/images.md](docs/images.md));
   the bundled [show-image](claude-plugin/show-image/README.md) plugin lets Claude show any PNG.
   Images pasted with Ctrl+V reach Claude on ssh hosts too ([docs/paste.md](docs/paste.md)).
+- **Files into Claude, on any host.** Drop files on the window, or click
+  UPLOAD (**Ctrl+Shift+F**): punkterm copies them to the session's host over
+  ssh and pastes an `@` mention, so Claude reads them into context
+  ([docs/upload.md](docs/upload.md)).
 - **Plan usage.** The signed-in account and its 5-hour and weekly limits, read
   from Claude Code's own cache on the active session's host. **Ctrl+Shift+U** (or ALL › in
   PLAN) shows every account across your hosts at once; a host running several
@@ -90,6 +97,7 @@ Remote hosts need tmux; the Claude features also need `python3`.
 | Ctrl+Shift+V / " | Split side by side / stacked |
 | Shift+Insert, middle-click | Paste the clipboard, the selection |
 | Ctrl+V (Claude on an ssh host) | Paste a clipboard image: copied to the host, attached ([docs/paste.md](docs/paste.md)) |
+| Ctrl+Shift+F, UPLOAD, drop a file | Send files into the session (to its host over ssh), `@`-mentioned for Claude ([docs/upload.md](docs/upload.md)) |
 | Ctrl+] / Ctrl+[ | Next / previous session |
 | Ctrl+Shift+1–9, Ctrl+Space 1 2 | Jump to a session by its number (12 and up too) |
 | Ctrl+Shift+Space | Next session that needs you |

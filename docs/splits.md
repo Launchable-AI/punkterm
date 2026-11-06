@@ -14,10 +14,10 @@ own card in the rail.
 
 - Click a pane to focus it; punkterm also runs `select-pane` so tmux agrees.
 - A zoomed window (`resize-pane -Z`) shows just its zoomed pane.
-- punkterm sizes tmux windows to its panel. A window sized by a larger
-  client (another terminal attached to the same session) is cut to the
-  panel from its top-left, so panes off to the right may not show until
-  punkterm is the client in use again.
+- punkterm sizes the window on screen to its panel (see
+  [Window sizes](#window-sizes)). A window larger than the panel (sized by
+  another punkterm with a bigger screen, until this one fits it) is cut to
+  the panel from its top-left.
 
 ## Closing a pane
 
@@ -44,15 +44,38 @@ width cc-rail is set to (`~/.cc-rail/state/ui.json`, else 34) and given that
 width straight back after each window resize, since tmux spreads a resize
 over every pane.
 
-## Window resizes
+## Window sizes
 
-punkterm tells tmux its size (`refresh-client -C`) only once a resize has
-held for 200 ms, and never a size under 30×6. Claude Code redraws its whole
-transcript, hard-wrapped, at every width it is given, so a window passing
-through a sliver while it is dragged or (un)maximized would otherwise leave
-a column of squashed text in the scrollback that no later resize can
-unwrap. The panel itself follows the window at once; only tmux waits.
-This can't fix scrollback that is already squashed.
+Claude Code reprints its whole transcript, hard-wrapped, every time its
+width changes, and the reprint often lands on top of the old one: text
+squashed to the old width, with the new one written over part of it, in
+tmux's own scrollback, where no later resize can undo it. So punkterm
+changes a window's width as rarely as it can:
+
+- **Only the window on screen.** punkterm never tells tmux a client size
+  (`refresh-client -C`). With tmux's default `window-size latest`, that
+  resizes every window the client is the latest client of, so two punkterms
+  on screens of different sizes would resize every session on the host
+  each time you switched machines. Instead punkterm runs `resize-window` on
+  the window it shows, and on no other. Hidden windows keep their size
+  until you open them.
+- **Only once it holds.** A window resize, a rail opening or closing, or a
+  font size change has to hold for 800 ms; a window has to be on screen for
+  400 ms (stepping through sessions doesn't resize the ones passed); and no
+  size under 30×6 is ever used. The panel follows at once; only tmux waits.
+- **Only while focused.** A punkterm without focus doesn't resize anything,
+  so two punkterms showing the same session don't take turns at it: the one
+  you're using wins, once.
+- New windows (Ctrl+Shift+T, resume) are made at the panel's size, not
+  tmux's default 80×24.
+
+`resize-window` sets that window's `window-size` option to `manual`, so it
+no longer follows another terminal attached with plain `tmux attach`; in
+that terminal, `tmux resize-window -A` fits it, and
+`tmux set -wu window-size` (in the window) hands it back to tmux. A
+punkterm from before this change still sends a client size; update every
+machine you run punkterm on. Scrollback that is already squashed stays as
+it is.
 
 ## In the rail
 

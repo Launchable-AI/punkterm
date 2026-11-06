@@ -373,6 +373,7 @@ impl App {
     fn header(&mut self, q: &mut Vec<Quad>, l: &Layout) {
         let t = self.theme.clone();
         let h = l.header;
+        self.upload_btn = None;
         let Some(p) = self.panes.get(self.active) else { return };
         let status = self.ui[self.active].status;
         let title = if p.title.is_empty() { p.subtitle.clone() } else { super::clean_title(&p.title) };
@@ -395,7 +396,7 @@ impl App {
         self.text(q, &il, h.x + (tab_w - self.px(8.0) - il.width) / 2.0, h.y + (h.h - il.height) / 2.0, tab_fg, NO_CLIP);
 
         let x = h.x + tab_w + self.px(16.0);
-        let right_reserve = self.px(220.0);
+        let right_reserve = self.px(300.0);
         let title = self.fit(&title, Font::Ui, 14.0, 650, h.w - tab_w - right_reserve);
         let tl = self.glyphs.text(&title, Font::Ui, self.px(14.0), 650, 0.0);
         let clip = [x, h.y, h.x + h.w - right_reserve, h.y + h.h];
@@ -406,6 +407,11 @@ impl App {
         let cy = h.y + h.h / 2.0;
         let mut rx = h.x + h.w - self.px(40.0);
         rx -= self.chip(q, &host_name, host_col, rx, cy, false) + self.px(8.0);
+        // UPLOAD: pick files to send into this session (drop works too).
+        let w = self.chip(q, "UPLOAD", t.accent, rx, cy, false);
+        let bh = self.px(16.0);
+        self.upload_btn = Some(Rect { x: rx - w, y: (cy - bh / 2.0).round(), w, h: bh });
+        rx -= w + self.px(8.0);
         if self.leader.is_some_and(|t| t.elapsed().as_secs() < 3) {
             rx -= self.chip(q, "LEADER", t.accent, rx, cy, true) + self.px(8.0);
         }
@@ -920,6 +926,7 @@ const KEYS_VIEW: &[(&str, &str)] = &[
     ("Drag  ⌃⇧C", "Select · copy"),
     ("⌃click", "Open link"),
     ("⇧Ins  middle", "Paste clipboard · selection"),
+    ("⌃⇧F  drop", "Upload a file into the session"),
     ("⌃?", "This help"),
 ];
 

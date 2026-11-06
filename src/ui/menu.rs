@@ -12,6 +12,7 @@ pub enum Act {
     SplitSide,
     SplitStacked,
     Fork,
+    Upload,
     Pick,
     NewGroup,
     MoveTo(usize),
@@ -186,6 +187,7 @@ impl App {
         if self.ui[i].status != Status::Shell {
             items.push(item("Fork Claude session…", Act::Fork));
         }
+        items.push(item("Upload file…", Act::Upload));
         items.push(divider());
         let picked = self.picked.contains(&p.id);
         items.push(item(if picked { "Unpick" } else { "Pick (for a group)" }, Act::Pick));
@@ -275,6 +277,10 @@ impl App {
                 self.select(i);
                 self.panes[i].write(b"/fork ".to_vec());
                 self.toast("FORK // TYPE ITS FIRST PROMPT, THEN ↵");
+            }
+            (Act::Upload, Some(i)) => {
+                self.select(i);
+                self.open_upload();
             }
             (Act::Pick, Some(i)) => self.pick(i),
             (Act::NewGroup, Some(i)) => {

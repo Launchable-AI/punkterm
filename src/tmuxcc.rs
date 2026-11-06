@@ -35,8 +35,8 @@ pub enum CcEvent {
 pub struct Writer {
     stdin: Mutex<ChildStdin>,
     queue: Arc<Mutex<VecDeque<Want>>>,
-    size: Mutex<(usize, usize)>,
-    window_sizes: Mutex<std::collections::HashMap<String, (usize, usize)>>,
+    /// Windows punkterm resized: the size asked for, and when.
+    window_sizes: Mutex<std::collections::HashMap<String, ((usize, usize), std::time::Instant)>>,
     pinned: Mutex<std::collections::HashMap<String, (usize, usize)>>,
     colours: Mutex<std::collections::HashMap<String, ([u8; 3], [u8; 3])>>,
 }
@@ -58,25 +58,24 @@ impl Writer {
         }
     }
 
-    /// This client's size; unchanged sizes are not re-sent (window drags
-    /// resize every frame).
-    pub fn set_size(&self, cols: usize, lines: usize) {
-        let mut last = self.size.lock().unwrap();
-        if *last != (cols, lines) {
-            *last = (cols, lines);
-            self.command(Want::Ignore, &format!("refresh-client -C {cols}x{lines}"));
-        }
-    }
-
-    /// This client's size for one window, overriding its overall size there.
-    /// True when it asked tmux for a new size.
-    pub fn set_window_size(&self, window: &str, cols: usize, lines: usize) -> bool {
-        let mut sizes = self.window_sizes.lock().unwrap();
-        if sizes.get(window) == Some(&(cols, lines)) {
+    /// Size one window, and only that one (`resize-window`, which makes
+    /// its `window-size` manual). punkterm never tells tmux a client size:
+    /// with `window-size latest` that resizes every window it is the latest
+    /// client of, and with two punkterms on different screens each one
+    /// resizes them all whenever it is used. Every resize makes Claude Code
+    /// reprint its transcript, hard-wrapped at the new width, so hidden
+    /// windows are left alone. `now` is the window's size as listed; a
+    /// request still unanswered is not repeated for a couple of seconds.
+    pub fn resize_window(&self, window: &str, now: (usize, usize), want: (usize, usize)) -> bool {
+        if now == want {
             return false;
         }
-        sizes.insert(window.to_string(), (cols, lines));
-        self.command(Want::Ignore, &format!("refresh-client -C {window}:{cols}x{lines}"));
+        let mut sizes = self.window_sizes.lock().unwrap();
+        if sizes.get(window).is_some_and(|(w, at)| *w == want && at.elapsed().as_secs() < 2) {
+            return false;
+        }
+        sizes.insert(window.to_string(), (want, std::time::Instant::now()));
+        self.command(Want::Ignore, &format!("resize-window -t {window} -x {} -y {}", want.0, want.1));
         true
     }
 
@@ -379,7 +378,7 @@ impl Conn {
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let writer = Arc::new(Writer { stdin: Mutex::new(stdin), queue: queue.clone(), size: Mutex::new((0, 0)), window_sizes: Default::default(), pinned: Default::default(), colours: Default::default() });
+        let writer = Arc::new(Writer { stdin: Mutex::new(stdin), queue: queue.clone(), window_sizes: Default::default(), pinned: Default::default(), colours: Default::default() });
         std::thread::spawn(move || read_loop(id, BufReader::new(stdout), queue, tx, wake));
         writer.list_panes();
         Ok(Conn { id, host, session: session.to_string(), writer, child })

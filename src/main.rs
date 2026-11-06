@@ -18,6 +18,7 @@ mod theme;
 mod tmuxcc;
 mod usage;
 mod ui;
+mod upload;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -274,6 +275,9 @@ impl ApplicationHandler for Win {
             }
             WindowEvent::Focused(f) => {
                 app.focused = f;
+                if f {
+                    app.fit_soon();
+                }
                 if let Some(p) = app.active_pane() {
                     if p.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
                         p.write(if f { b"\x1b[I".as_slice() } else { b"\x1b[O".as_slice() });
@@ -557,6 +561,10 @@ impl ApplicationHandler for Win {
                             app.toggle_usage();
                             true
                         }
+                        Some(KeyCode::KeyF) => {
+                            app.open_upload();
+                            true
+                        }
                         Some(KeyCode::KeyW) => {
                             app.close_active();
                             true
@@ -621,6 +629,18 @@ impl ApplicationHandler for Win {
                     app.clear_selection();
                     app.note_input();
                 }
+            }
+            // Files dropped on the window go to the active session (copied
+            // to its host first when that is remote).
+            WindowEvent::HoveredFile(_) => {
+                app.toast("DROP // SENDS TO THIS SESSION");
+                gpu.window.request_redraw();
+            }
+            WindowEvent::DroppedFile(path) => {
+                if let Some(id) = app.active_pane().map(|p| p.id) {
+                    app.upload_file(id, &path);
+                }
+                gpu.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse = (position.x, position.y);
@@ -721,6 +741,9 @@ impl ApplicationHandler for Win {
                     gpu.window.request_redraw();
                 } else if app.usage_open {
                     app.toggle_usage();
+                    gpu.window.request_redraw();
+                } else if !app.overview && app.upload_btn_at(mx, my) {
+                    app.open_upload();
                     gpu.window.request_redraw();
                 } else if app.footer_click(mx, my) {
                     gpu.window.request_redraw();

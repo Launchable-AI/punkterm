@@ -26,3 +26,6 @@ over ssh it can't see yours. punkterm brings the image over instead:
 
 Locally, Claude's own Ctrl+V already works and is left alone. The clipboard
 is read with `xclip` (X11) or `wl-paste` (Wayland); PNG and JPEG.
+
+To send a file rather than the clipboard (drag and drop, or the UPLOAD
+button), see [upload.md](upload.md).

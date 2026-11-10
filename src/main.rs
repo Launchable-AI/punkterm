@@ -605,6 +605,19 @@ impl ApplicationHandler for Win {
                         return;
                     }
                 }
+                // PageUp/PageDown scroll history (Shift: always; otherwise
+                // full-screen apps keep them).
+                if !m.control_key() && !m.alt_key() {
+                    let dir = match code {
+                        Some(KeyCode::PageUp) => 1,
+                        Some(KeyCode::PageDown) => -1,
+                        _ => 0,
+                    };
+                    if dir != 0 && app.page_scroll(dir, m.shift_key()) {
+                        gpu.window.request_redraw();
+                        return;
+                    }
+                }
                 if m.control_key() && !m.shift_key() && code == Some(KeyCode::Tab) {
                     app.cycle(1);
                     gpu.window.request_redraw();

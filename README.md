@@ -96,6 +96,7 @@ Remote hosts need tmux; the Claude features also need `python3`.
 | Ctrl+Shift+T | New shell on this host |
 | Ctrl+Shift+V / " | Split side by side / stacked |
 | Shift+Insert, middle-click | Paste the clipboard, the selection |
+| PageUp / PageDown, Shift+wheel | Scroll history; Shift+PageUp/Down when a full-screen app has the keys ([docs/scrollback.md](docs/scrollback.md)) |
 | Ctrl+V (Claude on an ssh host) | Paste a clipboard image: copied to the host, attached ([docs/paste.md](docs/paste.md)) |
 | Ctrl+Shift+F, UPLOAD, drop a file | Send files into the session (to its host over ssh), `@`-mentioned for Claude ([docs/upload.md](docs/upload.md)) |
 | Ctrl+] / Ctrl+[ | Next / previous session |

@@ -19,6 +19,12 @@ reporting on (Claude Code, tmux with `mouse on`, vim) get wheel events, and
 full-screen apps get arrow keys. Only otherwise does the wheel scroll
 punkterm's history. **Shift+wheel** always scrolls punkterm's history.
 
+**PageUp / PageDown** scroll punkterm's history a screen at a time
+(`App::page_scroll` in `src/ui.rs`). Full-screen apps on the alternate
+screen (vim, less, htop) get the keys instead; **Shift+PageUp /
+Shift+PageDown** always scroll punkterm's history. Ctrl or Alt with
+PageUp/PageDown is passed through to the app.
+
 While scrolled back, a badge in the terminal's top-right shows the position
 the way tmux's copy mode does: `[lines up/lines of history]`. It disappears
 when you're back at the bottom (typing also jumps back to the bottom).

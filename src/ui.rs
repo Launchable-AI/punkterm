@@ -2767,6 +2767,21 @@ impl App {
         }
     }
 
+    /// PageUp/PageDown (`dir` > 0 goes back): scroll punkterm's history by a
+    /// screen, unless a full-screen app (alt screen: vim, less, htop) is
+    /// running, which gets the key instead. `own` (Shift held) always
+    /// scrolls history. Returns whether the key was used here.
+    pub fn page_scroll(&mut self, dir: i32, own: bool) -> bool {
+        let Some(p) = self.panes.get(self.active) else { return false };
+        let mut term = p.term.lock();
+        if !own && term.mode().contains(TermMode::ALT_SCREEN) {
+            return false;
+        }
+        let page = term.screen_lines().saturating_sub(1).max(1) as i32;
+        term.scroll_display(alacritty_terminal::grid::Scroll::Delta(dir * page));
+        true
+    }
+
     /// The pane under (x, y) and its cell there (1-based column, row), when
     /// that pane's program asked for mouse reports (SGR encoding).
     fn report_cell(&self, x: f32, y: f32) -> Option<(usize, usize, usize)> {

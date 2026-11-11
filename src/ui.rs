@@ -307,6 +307,19 @@ pub struct App {
     pick_rx: Receiver<(u64, Result<Vec<std::path::PathBuf>, String>)>,
     /// The header's UPLOAD button, where it was last drawn.
     pub(crate) upload_btn: Option<Rect>,
+    /// Windows seen holding nothing but cc-rail rails, and since when.
+    rail_only: std::collections::HashMap<(u64, String), Instant>,
+    /// Ctrl+Shift+W pressed once on a session: (pane id, when). A second
+    /// press soon after ends it.
+    close_armed: Option<(u64, Instant)>,
+    /// The header's REFLOW button (Claude sessions only), where last drawn.
+    pub(crate) reflow_btn: Option<Rect>,
+    /// A busy Claude's REFLOW was clicked once: (pane id, when). A second
+    /// click soon after goes ahead.
+    reflow_armed: Option<(u64, Instant)>,
+    /// Reflows finished: (pane id, the session id, or why not).
+    reflow_tx: Sender<(u64, Result<String, String>)>,
+    reflow_rx: Receiver<(u64, Result<String, String>)>,
     /// Image files read for panes (images sent by path): pane id, the
     /// request, the bytes.
     img_tx: Sender<(u64, crate::graphics::FileRequest, Option<Vec<u8>>)>,
@@ -449,6 +462,7 @@ impl App {
         let (host_sys_tx, host_sys_rx) = channel();
         let (paste_tx, paste_rx) = channel();
         let (pick_tx, pick_rx) = channel();
+        let (reflow_tx, reflow_rx) = channel();
         let (img_tx, img_rx) = channel();
         let (dl_tx, dl_rx) = channel();
         let (resume_tx, resume_rx) = channel();
@@ -505,6 +519,12 @@ impl App {
             pick_tx,
             pick_rx,
             upload_btn: None,
+            reflow_btn: None,
+            rail_only: Default::default(),
+            close_armed: None,
+            reflow_armed: None,
+            reflow_tx,
+            reflow_rx,
             img_tx,
             img_rx,
             dl_tx,
@@ -1575,6 +1595,40 @@ impl App {
         self.upload_btn.is_some_and(|r| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)
     }
 
+    /// Clicked the header's REFLOW button.
+    pub fn reflow_btn_at(&self, x: f32, y: f32) -> bool {
+        self.reflow_btn.is_some_and(|r| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)
+    }
+
+    /// Whether pane `i` is a Claude in a tmux pane, which REFLOW can restart.
+    pub fn can_reflow(&self, i: usize) -> bool {
+        self.panes.get(i).is_some_and(|p| p.tmux_pane.is_some()) && self.ui.get(i).is_some_and(|u| u.status != Status::Shell)
+    }
+
+    /// REFLOW: quit the Claude in pane `i` and resume its session in the
+    /// same pane, so it reprints at the pane's width (see `reflow.rs`).
+    /// While Claude is working or asking, the first click only warns.
+    pub fn reflow(&mut self, i: usize) {
+        if !self.can_reflow(i) {
+            return self.toast("REFLOW // NOT A CLAUDE SESSION");
+        }
+        let p = &self.panes[i];
+        let (id, pane, ssh) = (p.id, p.tmux_pane.clone().unwrap_or_default(), self.hosts.get(p.host).and_then(|h| h.ssh.clone()));
+        let busy = matches!(self.ui[i].status, Status::Working | Status::Blocked);
+        let armed = self.reflow_armed.is_some_and(|(a, t)| a == id && t.elapsed().as_secs() < 4);
+        if busy && !armed {
+            self.reflow_armed = Some((id, Instant::now()));
+            return self.toast("REFLOW // CLAUDE IS BUSY: CLICK AGAIN TO STOP IT AND RESUME");
+        }
+        self.reflow_armed = None;
+        self.toast("REFLOW // RESTARTING CLAUDE…");
+        let (tx, wake) = (self.reflow_tx.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((id, crate::reflow::run(ssh.as_deref(), &pane)));
+            wake();
+        });
+    }
+
     /// Mark the active pane to join elsewhere, or clear the mark.
     pub fn mark(&mut self) {
         let Some(p) = self.panes.get(self.active) else { return };
@@ -1834,6 +1888,37 @@ impl App {
                         writer.pin_width(&r.id, rw, r.cols);
                     }
                 }
+            }
+        }
+        // A window left holding only cc-rail rails (its session's shell
+        // exited) shows nothing and would stay open for good: close it once
+        // it has been that way a couple of seconds (not a rail caught
+        // mid-setup).
+        if self.persist {
+            let mut windows: Vec<&str> = all.iter().map(|p| p.window_id.as_str()).collect();
+            windows.sort();
+            windows.dedup();
+            let now = Instant::now();
+            let lone: std::collections::HashSet<&str> = windows.into_iter().filter(|w| all.iter().filter(|p| p.window_id == *w).all(|p| p.rail)).collect();
+            self.rail_only.retain(|(c, w), _| *c != conn || lone.contains(w.as_str()));
+            let mut recheck = false;
+            for w in lone {
+                let since = *self.rail_only.entry((conn, w.to_string())).or_insert(now);
+                if since.elapsed() >= Duration::from_secs(2) {
+                    writer.command(tmuxcc::Want::Ignore, &format!("kill-window -t {w}"));
+                    self.rail_only.remove(&(conn, w.to_string()));
+                } else {
+                    recheck |= since == now;
+                }
+            }
+            // Look again once they have waited their two seconds.
+            if recheck {
+                let (wr, wake) = (writer.clone(), self.wake.clone());
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(2100));
+                    wr.list_panes();
+                    wake();
+                });
             }
         }
         // Rails included: they follow the terminal's theme too.
@@ -2579,6 +2664,42 @@ impl App {
 
     /// Close the active session's view. A tmux pane is only hidden here —
     /// it keeps running in tmux, and shows again on the next launch.
+    /// Ctrl+Shift+W: end the session on screen. Its tmux pane is killed, or
+    /// its whole window when nothing else of it is shown (taking the
+    /// window's cc-rail rail along). Asks for a second press first.
+    pub fn end_active(&mut self) {
+        let Some(p) = self.panes.get(self.active) else { return };
+        let id = p.id;
+        if !self.close_armed.is_some_and(|(a, t)| a == id && t.elapsed().as_secs() < 3) {
+            self.close_armed = Some((id, Instant::now()));
+            let name = if p.title.is_empty() { p.subtitle.clone() } else { clean_title(&p.title) };
+            return self.toast(format!("CLOSE // ⌃⇧W AGAIN TO END {}", truncate(&name, 40).to_uppercase()));
+        }
+        self.close_armed = None;
+        self.end_pane(self.active);
+    }
+
+    /// End pane `i` for good (see `end_active`); no confirmation.
+    pub fn end_pane(&mut self, i: usize) {
+        let Some(p) = self.panes.get(i) else { return };
+        let (Some(conn), Some(tp)) = (p.conn, p.tmux_pane.clone()) else {
+            p.term.lock().exit();
+            return;
+        };
+        let alone = !self.panes.iter().any(|q| q.id != p.id && q.conn == Some(conn) && q.window.is_some() && q.window == p.window);
+        let cmd = match (&p.window, alone) {
+            (Some(w), true) => format!("kill-window -t {w}"),
+            _ => format!("kill-pane -t {tp}"),
+        };
+        if let Some(c) = self.conns.iter().find(|c| c.id == conn) {
+            c.writer.command(tmuxcc::Want::Ignore, &cmd);
+            c.writer.list_panes();
+        }
+        self.select(i);
+        self.close_active();
+        self.toast("CLOSE // ENDED");
+    }
+
     pub fn close_active(&mut self) {
         let Some(p) = self.panes.get(self.active) else { return };
         if let (Some(conn), Some(tp)) = (p.conn, p.tmux_pane.clone()) {
@@ -3336,6 +3457,20 @@ impl App {
                     }
                 }
                 Err(e) => self.toast(format!("{what} // {}", e.to_uppercase())),
+            }
+            dirty = true;
+        }
+        // Reflows done: re-read the pane from tmux, whose history was
+        // cleared, so the squashed copy goes from punkterm's too.
+        while let Ok((id, r)) = self.reflow_rx.try_recv() {
+            match r {
+                Ok(_) => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == id) {
+                        p.resync_at = Some(Instant::now() + Duration::from_millis(300));
+                    }
+                    self.toast("REFLOW // RESUMED");
+                }
+                Err(e) => self.toast(format!("REFLOW // {}", e.to_uppercase())),
             }
             dirty = true;
         }

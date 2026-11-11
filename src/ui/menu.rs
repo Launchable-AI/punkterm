@@ -13,6 +13,7 @@ pub enum Act {
     SplitStacked,
     Fork,
     Upload,
+    Reflow,
     Pick,
     NewGroup,
     MoveTo(usize),
@@ -21,6 +22,7 @@ pub enum Act {
     Toggle(usize),
     Disband(usize),
     Detach,
+    End,
     HostNew(usize),
     HostResume(usize),
     HostConnect(usize),
@@ -187,6 +189,9 @@ impl App {
         if self.ui[i].status != Status::Shell {
             items.push(item("Fork Claude session…", Act::Fork));
         }
+        if self.can_reflow(i) {
+            items.push(item("Reflow (restart and resume)", Act::Reflow));
+        }
         items.push(item("Upload file…", Act::Upload));
         items.push(divider());
         let picked = self.picked.contains(&p.id);
@@ -205,6 +210,7 @@ impl App {
         }
         items.push(divider());
         items.push(item("Detach (keeps running)", Act::Detach));
+        items.push(item(if tmux { "Close (ends it in tmux)" } else { "Close" }, Act::End));
         let title = if p.title.is_empty() { p.subtitle.clone() } else { super::clean_title(&p.title) };
         Menu { pane: Some(p.id), title, items, at: (0.0, 0.0), hover: None }
     }
@@ -278,6 +284,10 @@ impl App {
                 self.panes[i].write(b"/fork ".to_vec());
                 self.toast("FORK // TYPE ITS FIRST PROMPT, THEN ↵");
             }
+            (Act::Reflow, Some(i)) => {
+                self.select(i);
+                self.reflow(i);
+            }
             (Act::Upload, Some(i)) => {
                 self.select(i);
                 self.open_upload();
@@ -293,6 +303,7 @@ impl App {
                 self.picked.insert(self.panes[i].id);
                 self.ungroup_picked();
             }
+            (Act::End, Some(i)) => self.end_pane(i),
             (Act::Detach, Some(i)) => {
                 self.select(i);
                 self.close_active();

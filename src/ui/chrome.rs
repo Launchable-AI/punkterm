@@ -374,6 +374,7 @@ impl App {
         let t = self.theme.clone();
         let h = l.header;
         self.upload_btn = None;
+        self.reflow_btn = None;
         let Some(p) = self.panes.get(self.active) else { return };
         let status = self.ui[self.active].status;
         let title = if p.title.is_empty() { p.subtitle.clone() } else { super::clean_title(&p.title) };
@@ -412,6 +413,12 @@ impl App {
         let bh = self.px(16.0);
         self.upload_btn = Some(Rect { x: rx - w, y: (cy - bh / 2.0).round(), w, h: bh });
         rx -= w + self.px(8.0);
+        // REFLOW: restart this Claude on its session, reprinted at this width.
+        if self.can_reflow(self.active) {
+            let w = self.chip(q, "REFLOW", t.accent, rx, cy, false);
+            self.reflow_btn = Some(Rect { x: rx - w, y: (cy - bh / 2.0).round(), w, h: bh });
+            rx -= w + self.px(8.0);
+        }
         if self.leader.is_some_and(|t| t.elapsed().as_secs() < 3) {
             rx -= self.chip(q, "LEADER", t.accent, rx, cy, true) + self.px(8.0);
         }
@@ -906,7 +913,7 @@ const KEYS_SESSIONS: &[(&str, &str)] = &[
     ("⌃⇧E", "Split: shell beside this pane"),
     ("⌃⇧N", "Connect to a host (ssh)"),
     ("⌃⇧R", "Reconnect hosts"),
-    ("⌃⇧W", "Detach session (keeps running)"),
+    ("⌃⇧W ⌃⇧W", "Close session (ends it in tmux)"),
     ("⌃]  ⌃[", "Next / previous session"),
     ("⌃⇥  ⌃⇧⇥", "Next / previous session"),
     ("⌃⇧1–9  ⌃␣ 12", "Jump to session (number as shown)"),

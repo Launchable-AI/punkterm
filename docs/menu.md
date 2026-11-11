@@ -15,12 +15,14 @@ mouse, or ↑ ↓ and ↵; any other key or a click outside closes it.
 | Split side by side / stacked | A new shell beside or below it |
 | Break out of split | tmux `break-pane`, back to a window (and session) of its own |
 | Fork Claude session… | Switches to it and types `/fork `: Claude Code's fork, which carries the conversation into a new background session, wants a first prompt, so finish it and press ↵ |
+| Reflow (restart and resume) | Quits that Claude and resumes its session in place, reprinted at the pane's width (see [splits.md](splits.md#reflow-fix-a-squashed-session)) |
 | Upload file… | Switches to it and opens a file picker; the files go into that session (see [upload.md](upload.md)) |
 | Pick / Unpick | For a new group (as Shift+click) |
 | New group… | From the picked sessions, or just this one; asks for a name |
 | Move to *group* | Into that group |
 | Remove from group / Rename group… | |
 | Detach (keeps running) | Drop it from punkterm; it keeps running in tmux |
+| Close (ends it in tmux) | Kill its tmux pane, or its window (rail and all) when nothing else there is shown; as Ctrl+Shift+W twice |
 
 **On a group header:** Roll up / Expand, Rename group…, Ungroup all.
 

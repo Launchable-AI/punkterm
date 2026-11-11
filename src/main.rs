@@ -19,6 +19,7 @@ mod tmuxcc;
 mod usage;
 mod ui;
 mod upload;
+mod reflow;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -566,7 +567,7 @@ impl ApplicationHandler for Win {
                             true
                         }
                         Some(KeyCode::KeyW) => {
-                            app.close_active();
+                            app.end_active();
                             true
                         }
                         Some(KeyCode::KeyC) => {
@@ -754,6 +755,9 @@ impl ApplicationHandler for Win {
                     gpu.window.request_redraw();
                 } else if app.usage_open {
                     app.toggle_usage();
+                    gpu.window.request_redraw();
+                } else if !app.overview && app.reflow_btn_at(mx, my) {
+                    app.reflow(app.active);
                     gpu.window.request_redraw();
                 } else if !app.overview && app.upload_btn_at(mx, my) {
                     app.open_upload();

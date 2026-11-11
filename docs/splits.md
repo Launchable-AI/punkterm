@@ -27,6 +27,18 @@ as tmux does; with none left there, to the nearest session in the rail on the
 same host, then any session (`App::successor`). Sessions in rolled-up groups
 come last.
 
+**Ctrl+Shift+W**, pressed twice within 3 s (or **Close (ends it in tmux)** in
+a card's menu), ends the session on screen: punkterm kills its tmux pane, or
+its whole window (with the window's cc-rail rail) when no other pane of that
+window is shown. To drop a session from punkterm and leave it running, use
+**Detach (keeps running)** in the card's menu. Code: `App::end_active` /
+`end_pane` in `src/ui.rs`.
+
+A window left holding nothing but cc-rail rails (its session's shell exited,
+here or anywhere else) shows nothing in punkterm and would otherwise stay
+open in tmux for good: punkterm closes such a window once it has been that
+way for 2 s.
+
 ## Resizing
 
 Drag the line between two panes to resize them (the pointer turns into a
@@ -74,8 +86,30 @@ no longer follows another terminal attached with plain `tmux attach`; in
 that terminal, `tmux resize-window -A` fits it, and
 `tmux set -wu window-size` (in the window) hands it back to tmux. A
 punkterm from before this change still sends a client size; update every
-machine you run punkterm on. Scrollback that is already squashed stays as
-it is.
+machine you run punkterm on.
+
+### REFLOW: fix a squashed session
+
+Scrollback that is already squashed stays as it is, in tmux too. **REFLOW**
+in the header of a Claude session (or **Reflow (restart and resume)** in
+its card's right-click menu) fixes it: punkterm quits that Claude and
+resumes the same session in the same pane, which reprints the conversation
+at the pane's width. On the session's host, a script (`src/reflow.rs`):
+
+1. finds the Claude process under the tmux pane, and its session id, folder
+   and account config (`CLAUDE_CONFIG_DIR`), plus the flags worth keeping
+   (`--dangerously-skip-permissions`, `--model`, `--permission-mode`,
+   `--add-dir` and a few more; never a prompt);
+2. stops it with SIGTERM and waits for it to exit (up to 8 s);
+3. clears the pane's tmux history, so the squashed copy goes;
+4. types `clear && cd <folder> && claude --resume <id> …` into the pane's
+   shell, so its PATH and aliases apply. A pane whose own process is Claude
+   (no shell) is respawned with that command instead.
+
+A session with nothing said yet has no transcript to resume, and is left
+running. While Claude is working or asking for permission, the first click
+only warns; click again within 4 s to stop it and resume. Restarting ends
+what that Claude has running in the background (its agents and shells).
 
 ## In the rail
 

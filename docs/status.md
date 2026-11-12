@@ -18,6 +18,17 @@ red "awaiting permission" line; the card itself is highlighted only when it
 is the selected session, so the two are never confused. (In the Ctrl+Shift+D
 grid, a Blocked tile still pulses red.)
 
+## Model
+
+The session header's second line names the model a Claude session is
+using, between the program and the terminal size, e.g.
+`HOST // CLAUDE // OPUS 5.5 // 182×48`. It is the model of Claude's latest
+reply in the session's transcript (`model` in `src/timeline.rs`'s script,
+`timeline::model_label`), read with the timeline every 10 s (3 s while the
+timeline rail is open). After `/model`, the header changes with the next
+reply. Sessions with no reply yet, and panes that aren't tmux panes, show
+no model.
+
 ## Background work
 
 A session's own background work is read from its screen (`claude::background`)

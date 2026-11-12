@@ -58,6 +58,7 @@ def arg(name, i):
     if name in ('WebFetch',): return pick('url')
     return pick('description', 'query', 'pattern', 'skill', 'command', 'prompt')
 ev = []
+model = ''
 from datetime import datetime
 def ms(t):
     try: return int(datetime.fromisoformat(str(t).replace('Z', '+00:00')).timestamp() * 1000)
@@ -69,7 +70,9 @@ for l in lines:
     if t in ('custom-title', 'agent-name') and not name: name = o.get('customTitle') or o.get('agentName')
     if t == 'ai-title' and o.get('aiTitle'): ai = o['aiTitle']
     if t not in ('user', 'assistant') or o.get('isSidechain') or o.get('isMeta'): continue
-    c = (o.get('message') or {}).get('content')
+    msg = o.get('message') or {}
+    if t == 'assistant' and str(msg.get('model', '')).startswith('claude'): model = msg['model']
+    c = msg.get('content')
     at = ms(o.get('timestamp'))
     if t == 'user':
         if isinstance(c, list):
@@ -83,6 +86,7 @@ for l in lines:
             elif b.get('type') == 'tool_use': ev.append(('tool', at, flat(b.get('name', '?') + ' ' + arg(b.get('name'), b.get('input')), 120)))
 title = name or (locals().get('ai')) or ''
 if title: print('title\t0\t' + flat(title, 120))
+if model: print('model\t0\t' + flat(model, 80))
 for k, at, s in ev[-400:]: print('%s\t%d\t%s' % (k, at, s))
 "#;
 
@@ -104,6 +108,8 @@ pub struct Entry {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Timeline {
     pub title: String,
+    /// The model of Claude's latest reply, e.g. "claude-opus-5-5".
+    pub model: String,
     pub entries: Vec<Entry>,
 }
 
@@ -117,6 +123,10 @@ pub fn parse(out: &str) -> Option<Timeline> {
                 t.title = text.to_string();
                 continue;
             }
+            "model" => {
+                t.model = text.to_string();
+                continue;
+            }
             "ask" => Kind::Ask,
             "say" => Kind::Say,
             "tool" => Kind::Tool,
@@ -124,7 +134,22 @@ pub fn parse(out: &str) -> Option<Timeline> {
         };
         t.entries.push(Entry { kind, at_ms: at.parse().unwrap_or(0), text: text.to_string() });
     }
-    (!t.entries.is_empty() || !t.title.is_empty()).then_some(t)
+    (!t.entries.is_empty() || !t.title.is_empty() || !t.model.is_empty()).then_some(t)
+}
+
+/// A model id as people say it: "claude-opus-5-5" → "OPUS 5.5",
+/// "claude-sonnet-4-5-20250929" → "SONNET 4.5". Ids of other shapes are
+/// shown as they are, without the "claude-" prefix.
+pub fn model_label(id: &str) -> String {
+    let rest = id.strip_prefix("claude-").unwrap_or(id);
+    let mut parts = rest.split('-');
+    let family = parts.next().unwrap_or("");
+    let nums: Vec<&str> = parts.take_while(|n| n.len() <= 2 && n.chars().all(|c| c.is_ascii_digit())).collect();
+    if family.chars().all(|c| c.is_ascii_alphabetic()) && !family.is_empty() && !nums.is_empty() {
+        format!("{} {}", family, nums.join(".")).to_uppercase()
+    } else {
+        rest.to_uppercase()
+    }
 }
 
 /// Read the conversation in tmux pane `pane` on a host (`None`: local).
@@ -158,5 +183,15 @@ mod tests {
         assert_eq!(t.entries[0].kind, Kind::Ask);
         assert_eq!(t.entries[2].text, "done\tok");
         assert!(parse("").is_none());
+        assert_eq!(parse("model\t0\tclaude-opus-5-5\n").unwrap().model, "claude-opus-5-5");
+    }
+
+    #[test]
+    fn model_labels() {
+        assert_eq!(model_label("claude-opus-5-5"), "OPUS 5.5");
+        assert_eq!(model_label("claude-sonnet-4-5-20250929"), "SONNET 4.5");
+        assert_eq!(model_label("claude-haiku-5-5"), "HAIKU 5.5");
+        assert_eq!(model_label("claude-fable-5-1"), "FABLE 5.1");
+        assert_eq!(model_label("claude-3-5-sonnet-20241022"), "3-5-SONNET-20241022");
     }
 }

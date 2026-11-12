@@ -384,6 +384,12 @@ impl App {
         let host_name = self.hosts.get(host).map(|h| h.name.to_uppercase()).unwrap_or_default();
         let host_col = self.host_color(host);
         let idx = format!("{:02}", self.active + 1);
+        // The model of Claude's latest reply, from the session's transcript.
+        let model = if status == Status::Shell {
+            String::new()
+        } else {
+            self.active_timeline().filter(|t| !t.model.is_empty()).map_or(String::new(), |t| crate::timeline::model_label(&t.model))
+        };
 
         // Index tab, flush in the square corner, filled with the session's state.
         let tab_w = self.px(54.0);
@@ -402,7 +408,12 @@ impl App {
         let tl = self.glyphs.text(&title, Font::Ui, self.px(14.0), 650, 0.0);
         let clip = [x, h.y, h.x + h.w - right_reserve, h.y + h.h];
         self.text(q, &tl, x, h.y + self.px(7.0), t.fg, clip);
-        self.meta(q, &[&host_name, &prog, &dims], x, h.y + self.px(28.0), t.muted);
+        let mut parts: Vec<&str> = vec![&host_name, &prog];
+        if !model.is_empty() {
+            parts.push(&model);
+        }
+        parts.push(&dims);
+        self.meta(q, &parts, x, h.y + self.px(28.0), t.muted);
 
         // Right: state chip, then host chip.
         let cy = h.y + h.h / 2.0;

@@ -39,6 +39,10 @@ that was squashed before.
   or output; plus the other sessions with work running. Drag its edge to
   widen it (see [docs/tasks.md](docs/tasks.md)).
 - **Dashboard.** **Ctrl+Shift+D** shows every session as a live tile.
+- **Agents talking to each other.** **Ctrl+Shift+J** shows the
+  [jotbus-local](https://jotbus.com) traffic between agents on a host: who
+  is on the bus, which session each runs in, and the messages back and
+  forth ([docs/bus.md](docs/bus.md)).
 - **Inline images.** Images Claude Code draws with the kitty graphics protocol
   show in place, through tmux and over ssh (see [docs/images.md](docs/images.md));
   the bundled [show-image](claude-plugin/show-image/README.md) plugin lets Claude show any PNG.
@@ -108,6 +112,7 @@ Remote hosts need tmux; the Claude features also need `python3`.
 | Ctrl+Shift+H | Conversation timeline |
 | Ctrl+Shift+K | Background tasks: agents and shells |
 | Ctrl+Shift+U | Plan usage for every account on your hosts |
+| Ctrl+Shift+J | Agent bus: jotbus-local messages between sessions ([docs/bus.md](docs/bus.md)) |
 | ↺ beside a host | Resume one of its recent Claude sessions (type to search them) |
 | Right-click a host's heading | Disconnect, connect or remove that host |
 | Drag the rail's edge | Make the rail wider or narrower (double-click: back to the default) |
@@ -139,7 +144,7 @@ theme. The choice is remembered.
 | `~/.cache/punkterm/` | ssh control sockets, generated sounds |
 
 More detail in [docs/](docs): [hosts](docs/hosts.md), [status](docs/status.md),
-[scrollback](docs/scrollback.md), [splits](docs/splits.md), [tasks](docs/tasks.md),
+[scrollback](docs/scrollback.md), [splits](docs/splits.md), [tasks](docs/tasks.md), [bus](docs/bus.md),
 [links](docs/links.md), [themes](docs/themes.md).
 
 ## License

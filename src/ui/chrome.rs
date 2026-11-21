@@ -126,6 +126,7 @@ impl App {
         self.toast_layer(&mut q, &l, &mut animating);
         self.menu_layer(&mut q);
         self.usage_layer(&mut q, dt, &mut animating);
+        self.bus_layer(&mut q, dt, &mut animating);
         self.resume_layer(&mut q);
         self.help_layer(&mut q, dt, &mut animating);
         self.prompt_layer(&mut q, dt, &mut animating);
@@ -933,6 +934,7 @@ const KEYS_SESSIONS: &[(&str, &str)] = &[
     ("⌃⇧H", "Conversation timeline (right rail)"),
     ("⌃⇧K", "Background tasks: agents, shells (right rail)"),
     ("⌃⇧U", "Plan usage, every account"),
+    ("⌃⇧J", "Agent bus: jotbus-local messages"),
 ];
 
 const KEYS_VIEW: &[(&str, &str)] = &[
@@ -1605,6 +1607,259 @@ impl App {
         self.label(q, hint, Font::Mono, 9.0, 600, 1.0, x, r.y + r.h - self.px(24.0), with_alpha(t.muted, e));
     }
 
+    /// The BUS view: one host's jotbus-local bus. On the left who is on it
+    /// (click one: its session) and its channels (click one: only it); on
+    /// the right the messages, newest at the bottom.
+    fn bus_layer(&mut self, q: &mut Vec<Quad>, dt: f32, animating: &mut bool) {
+        let mut bt = self.bus.t;
+        let e = Self::fade(&mut bt, self.bus.open, dt, 0.18, animating);
+        self.bus.t = bt;
+        self.bus.hits.clear();
+        if e <= 0.0 {
+            self.bus.panel = Rect::default();
+            return;
+        }
+        let t = self.theme.clone();
+        let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+        self.rect(q, Rect { x: 0.0, y: 0.0, w, h }, with_alpha(t.bg, 0.72 * e), 0.0, NO_CLIP);
+        let pw = self.px(1240.0).min(w - self.px(48.0));
+        let ph = (h - self.px(96.0)).max(self.px(200.0)).min(h - self.px(24.0));
+        let r = Rect { x: ((w - pw) / 2.0).round(), y: ((h - ph) / 2.0 + (1.0 - e) * self.px(14.0)).round(), w: pw, h: ph };
+        self.bus.panel = r;
+        let c = self.px(18.0);
+        let cuts = [c, 0.0, c, 0.0];
+        q.push(Quad {
+            rect: [r.x, r.y + self.px(10.0), r.w, r.h],
+            uv: cuts,
+            color: [0.0, 0.0, 0.0, 0.6 * e],
+            params: [kind::SHADOW, 0.0, 0.0, self.px(24.0)],
+            clip: NO_CLIP,
+            ..Default::default()
+        });
+        self.shape(q, r, with_alpha(t.surface, 0.98 * e), None, cuts);
+        q.push(Quad {
+            rect: [r.x, r.y, r.w, r.h],
+            uv: cuts,
+            color: with_alpha(t.accent, e),
+            color2: with_alpha(t.accent2, e),
+            params: [kind::GRADIENT_STROKE, 0.0, self.px(1.0).max(1.0), 0.0],
+            clip: NO_CLIP,
+            ..Default::default()
+        });
+        let x = r.x + self.px(32.0);
+        let right = r.x + r.w - self.px(32.0);
+        let mut y = r.y + self.px(26.0);
+        let shown = self.bus_shown();
+        let host_name = |a: &Self, hh: usize| a.hosts.get(hh).map_or(String::new(), |h| h.name.to_uppercase());
+        let tw = self.label(q, "BUS", Font::Ui, 15.0, 800, 3.4, x, y, with_alpha(t.accent, e));
+        let sub = shown.map(|hh| host_name(self, hh)).unwrap_or_default();
+        self.meta(q, &["JOTBUS-LOCAL", &sub], x + tw + self.px(18.0), y + self.px(4.0), with_alpha(t.muted, e));
+        let esc = "ESC  CLOSE";
+        let ew = self.measure(esc, Font::Mono, 9.5, 600, 1.2);
+        self.label(q, esc, Font::Mono, 9.5, 600, 1.2, right - ew, y + self.px(4.0), with_alpha(t.muted, e));
+        // Host tabs, when more than one host has a bus.
+        let hosts = self.bus_hosts();
+        if hosts.len() > 1 {
+            let mut tx = right - ew - self.px(24.0);
+            for &hh in hosts.iter().rev() {
+                let name = host_name(self, hh);
+                let nw = self.measure(&name, Font::Mono, 9.5, 700, 1.2);
+                let b = Rect { x: tx - nw - self.px(16.0), y: y - self.px(1.0), w: nw + self.px(16.0), h: self.px(18.0) };
+                let on = shown == Some(hh);
+                let hc = self.host_color(hh);
+                self.shape(q, b, with_alpha(hc, if on { 0.18 } else { 0.05 } * e), Some(with_alpha(hc, if on { 0.8 } else { 0.35 } * e)), [self.px(4.0), 0.0, 0.0, 0.0]);
+                self.label(q, &name, Font::Mono, 9.5, 700, 1.2, b.x + self.px(8.0), b.y + self.px(4.0), with_alpha(if on { hc } else { t.muted }, e));
+                self.bus.hits.push((b, crate::ui::bus::BusHit::Host(hh)));
+                tx = b.x - self.px(8.0);
+            }
+        }
+        y += self.px(36.0);
+        self.rect(q, Rect { x, y, w: right - x, h: self.px(1.0).max(1.0) }, with_alpha(t.border, e), 0.0, NO_CLIP);
+        y += self.px(22.0);
+        let hint = "⌃⇧J  ·  CLICK AN AGENT: ITS SESSION  ·  A CHANNEL: ONLY IT  ·  TAB: NEXT HOST  ·  WHEEL: OLDER";
+        let foot_y = r.y + r.h - self.px(24.0);
+        self.label(q, hint, Font::Mono, 9.0, 600, 1.0, x, foot_y, with_alpha(t.muted, e));
+        let Some(hh) = shown else {
+            let msg = if self.bus.data.is_empty() {
+                "Reading the bus on each host…"
+            } else {
+                "No jotbus-local on these hosts. Set it up with `npx jotbus-local`, then start agent sessions."
+            };
+            self.label(q, msg, Font::Ui, 12.0, 400, 0.0, x, y, with_alpha(t.muted, e));
+            return;
+        };
+        let bus = self.bus.data.get(&hh).cloned().unwrap_or_default();
+        // Each name keeps one colour: agents in the order they joined, then
+        // other authors as they first speak.
+        let palette = [t.accent, t.accent2, t.busy, t.ready, t.warning, t.ansi[5], t.ansi[6], t.ok];
+        let mut names: Vec<String> = bus.agents.iter().map(|a| a.name.to_lowercase()).collect();
+        for m in &bus.messages {
+            if !names.contains(&m.author.to_lowercase()) {
+                names.push(m.author.to_lowercase());
+            }
+        }
+        let color_of = |n: &str| names.iter().position(|x| x == &n.to_lowercase()).map_or(t.muted, |k| palette[k % palette.len()]);
+        let body_top = y;
+        let body_bot = foot_y - self.px(16.0);
+
+        // Left: the agents, then the channels.
+        let lw = self.px(300.0);
+        let lx = x;
+        let lr = x + lw;
+        let mut ly = body_top;
+        let head = format!("AGENTS · {}", bus.agents.len());
+        self.label(q, &head, Font::Ui, 10.0, 700, 2.4, lx, ly, with_alpha(t.accent2, e));
+        ly += self.px(24.0);
+        if bus.agents.is_empty() {
+            self.label(q, "Nobody is on the bus now.", Font::Ui, 11.5, 400, 0.0, lx, ly, with_alpha(t.muted, e));
+            ly += self.px(24.0);
+        }
+        let now = crate::usage::now_ms();
+        let ago = |ms: u64| {
+            let s = now.saturating_sub(ms) / 1000;
+            match s {
+                0..60 => "now".to_string(),
+                60..3600 => format!("{}m ago", s / 60),
+                3600..172800 => format!("{}h ago", s / 3600),
+                _ => format!("{}d ago", s / 86400),
+            }
+        };
+        for a in &bus.agents {
+            if ly + self.px(44.0) > body_bot - self.px(60.0) {
+                break;
+            }
+            let row = Rect { x: lx - self.px(8.0), y: ly - self.px(6.0), w: lw + self.px(8.0), h: self.px(42.0) };
+            let pane = self.bus_pane(hh, a.pane.as_deref());
+            let col = color_of(&a.name);
+            let fresh = now.saturating_sub(a.active_ms) < 120_000;
+            self.shape(q, row, with_alpha(t.surface_alt, 0.35 * e), None, [self.px(6.0), 0.0, 0.0, 0.0]);
+            self.rect(q, Rect { x: row.x, y: row.y, w: self.px(2.0), h: row.h }, with_alpha(col, e), 0.0, NO_CLIP);
+            let d = self.px(6.0);
+            self.shape(q, Rect { x: lx, y: ly + self.px(4.0), w: d, h: d }, with_alpha(if fresh { t.ok } else { t.muted }, e), None, [d / 2.0, 0.0, d / 2.0, 0.0]);
+            let kind_w = self.measure(&a.kind, Font::Mono, 9.0, 600, 0.8);
+            self.label(q, &a.kind, Font::Mono, 9.0, 600, 0.8, lr - kind_w, ly + self.px(1.0), with_alpha(t.muted, e));
+            let name = self.fit(&format!("@{}", a.name), Font::Mono, 12.0, 700, lr - lx - self.px(14.0) - kind_w - self.px(8.0));
+            self.label(q, &name, Font::Mono, 12.0, 700, 0.0, lx + self.px(14.0), ly - self.px(1.0), with_alpha(col, e));
+            let project = a.cwd.rsplit('/').find(|s| !s.is_empty()).unwrap_or(&a.cwd).to_string();
+            let where_ = match pane {
+                Some(i) => {
+                    let p = &self.panes[i];
+                    let title = if p.title.is_empty() { p.subtitle.clone() } else { super::clean_title(&p.title) };
+                    format!("{project} · {} · → {title}", ago(a.active_ms))
+                }
+                None => format!("{project} · {}", ago(a.active_ms)),
+            };
+            let where_ = self.fit(&where_, Font::Mono, 9.5, 500, lr - lx - self.px(14.0));
+            self.label(q, &where_, Font::Mono, 9.5, 500, 0.0, lx + self.px(14.0), ly + self.px(16.0), with_alpha(if pane.is_some() { t.fg } else { t.muted }, 0.8 * e));
+            self.bus.hits.push((row, crate::ui::bus::BusHit::Agent(pane)));
+            ly += self.px(48.0);
+        }
+        ly += self.px(12.0);
+        self.label(q, "CHANNELS", Font::Ui, 10.0, 700, 2.4, lx, ly, with_alpha(t.accent2, e));
+        ly += self.px(24.0);
+        for (ch, latest) in &bus.channels {
+            if ly + self.px(20.0) > body_bot {
+                break;
+            }
+            let on = self.bus.filter.as_deref() == Some(ch.as_str());
+            let row = Rect { x: lx - self.px(8.0), y: ly - self.px(4.0), w: lw + self.px(8.0), h: self.px(22.0) };
+            if on {
+                self.shape(q, row, with_alpha(t.accent, 0.12 * e), Some(with_alpha(t.accent, 0.6 * e)), [self.px(4.0), 0.0, 0.0, 0.0]);
+            }
+            let n = format!("{latest}");
+            let nw = self.measure(&n, Font::Mono, 9.5, 500, 0.0);
+            self.label(q, &n, Font::Mono, 9.5, 500, 0.0, lr - nw, ly + self.px(1.0), with_alpha(t.muted, e));
+            let name = self.fit(&format!("#{ch}"), Font::Mono, 11.5, 600, lr - lx - nw - self.px(12.0));
+            self.label(q, &name, Font::Mono, 11.5, 600, 0.0, lx, ly, with_alpha(if on { t.accent } else { t.fg }, e));
+            self.bus.hits.push((row, crate::ui::bus::BusHit::Channel(ch.clone())));
+            ly += self.px(26.0);
+        }
+
+        // Right: the messages, oldest to newest, the newest at the bottom.
+        let fx = lr + self.px(40.0);
+        self.rect(q, Rect { x: fx - self.px(20.0), y: body_top, w: self.px(1.0).max(1.0), h: body_bot - body_top }, with_alpha(t.border, e), 0.0, NO_CLIP);
+        let fw = right - fx;
+        let size = 11.5;
+        let cw = self.measure("0000000000", Font::Mono, size, 400, 0.0) / 10.0;
+        let per = ((fw - self.px(14.0)) / cw.max(1.0)).floor().max(10.0) as usize;
+        let (head_h, line_h, gap) = (self.px(20.0), self.px(17.0), self.px(16.0));
+        let filter = self.bus.filter.clone();
+        let msgs: Vec<&crate::comms::Msg> = bus.messages.iter().filter(|m| filter.as_ref().is_none_or(|f| &m.channel == f)).collect();
+        let entries: Vec<(&crate::comms::Msg, Vec<String>)> = msgs
+            .into_iter()
+            .map(|m| {
+                let text = m.content.replace("**", "");
+                let mut lines = Vec::new();
+                for l in text.trim_end().lines() {
+                    if l.trim().is_empty() {
+                        lines.push(String::new());
+                    } else {
+                        let lead: String = l.chars().take_while(|c| *c == ' ').collect();
+                        lines.extend(wrap_all(l, per.saturating_sub(lead.len()).max(10)).into_iter().map(|w| format!("{lead}{w}")));
+                    }
+                }
+                (m, lines)
+            })
+            .collect();
+        let total: f32 = entries.iter().map(|(_, l)| head_h + l.len() as f32 * line_h + gap).sum();
+        let view = body_bot - body_top;
+        self.bus.scroll_max = (total - view).max(0.0);
+        self.bus.scroll = self.bus.scroll.min(self.bus.scroll_max);
+        let clip = [fx - self.px(8.0), body_top, right, body_bot];
+        if entries.is_empty() {
+            let msg = if filter.is_some() { "Nothing on this channel yet." } else { "No messages yet." };
+            self.label(q, msg, Font::Ui, 12.0, 400, 0.0, fx, body_top, with_alpha(t.muted, e));
+        }
+        let mut ey = body_bot - total.min(view) + if total > view { -(self.bus.scroll_max - self.bus.scroll) } else { 0.0 };
+        for (m, lines) in &entries {
+            let eh = head_h + lines.len() as f32 * line_h;
+            if ey + eh < body_top || ey > body_bot {
+                ey += eh + gap;
+                continue;
+            }
+            let col = color_of(&m.author);
+            let bar_top = ey.max(body_top);
+            let bar_bot = (ey + eh).min(body_bot);
+            if bar_bot > bar_top {
+                self.rect(q, Rect { x: fx - self.px(10.0), y: bar_top, w: self.px(2.0), h: bar_bot - bar_top }, with_alpha(col, 0.8 * e), 0.0, NO_CLIP);
+            }
+            // Header: time, channel, who, and whom it names.
+            let mut hx = fx;
+            let put = |a: &mut Self, q: &mut Vec<Quad>, s: &str, font: Font, size: f32, weight: u16, c: Rgba, hx: &mut f32| {
+                let l = a.glyphs.text(s, font, a.px(size), weight, 0.0);
+                a.text(q, &l, *hx, ey, with_alpha(c, e), clip);
+                *hx += l.width + a.px(8.0);
+            };
+            put(self, q, &m.hm, Font::Mono, 10.0, 500, t.muted, &mut hx);
+            if filter.is_none() {
+                put(self, q, &format!("#{}", m.channel), Font::Mono, 10.0, 600, t.accent2, &mut hx);
+            }
+            put(self, q, &format!("@{}", m.author), Font::Mono, 11.5, 700, col, &mut hx);
+            let to: Vec<String> = crate::comms::mentions(&m.content).into_iter().filter(|n| *n != m.author.to_lowercase()).collect();
+            if !to.is_empty() {
+                put(self, q, "→", Font::Mono, 11.0, 500, t.muted, &mut hx);
+                for n in &to {
+                    let c = if n == "all" { t.fg } else { color_of(n) };
+                    put(self, q, &format!("@{n}"), Font::Mono, 10.5, 600, c, &mut hx);
+                }
+            }
+            let mut ly = ey + head_h;
+            for l in lines {
+                if ly + line_h >= body_top && ly <= body_bot && !l.is_empty() {
+                    let tl = self.glyphs.text(l, Font::Mono, self.px(size), 400, 0.0);
+                    self.text(q, &tl, fx, ly, with_alpha(t.fg, 0.92 * e), clip);
+                }
+                ly += line_h;
+            }
+            ey += eh + gap;
+        }
+        if self.bus.scroll > 0.5 {
+            let more = "↓ NEWER BELOW";
+            let mw = self.measure(more, Font::Mono, 9.0, 600, 1.0);
+            self.label(q, more, Font::Mono, 9.0, 600, 1.0, right - mw, foot_y, with_alpha(t.accent, e));
+        }
+    }
+
     /// One account's block in the usage overview, from `y` between `x` and
     /// `right`: name, hosts, status, then each limit. Returns the next y.
     fn usage_account(&mut self, q: &mut Vec<Quad>, v: &crate::ui::AccountView, x: f32, right: f32, mut y: f32, e: f32) -> f32 {
@@ -2141,6 +2396,36 @@ fn span(ms: u64) -> String {
     }
 }
 
+/// Wrap `text` at `per` chars a line, all of it: a word longer than a line
+/// (a path, a URL) is broken across lines rather than cut.
+fn wrap_all(text: &str, per: usize) -> Vec<String> {
+    let per = per.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for w in text.split_whitespace() {
+        let n = cur.chars().count();
+        let wn = w.chars().count();
+        if n > 0 && n + 1 + wn > per {
+            out.push(std::mem::take(&mut cur));
+        }
+        if wn > per {
+            let cs: Vec<char> = w.chars().collect();
+            let mut chunks: Vec<String> = cs.chunks(per).map(|c| c.iter().collect()).collect();
+            cur = chunks.pop().unwrap_or_default();
+            out.extend(chunks);
+            continue;
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(w);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 fn wrap(text: &str, per: usize, max: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -2168,4 +2453,17 @@ fn wrap(text: &str, per: usize, max: usize) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_all;
+
+    #[test]
+    fn wraps_everything() {
+        assert_eq!(wrap_all("one two three", 7), ["one two", "three"]);
+        // A word longer than a line is broken, not cut.
+        assert_eq!(wrap_all("see /a/very/long/path ok", 8), ["see", "/a/very/", "long/pat", "h ok"]);
+        assert!(wrap_all("   ", 5).is_empty());
+    }
 }

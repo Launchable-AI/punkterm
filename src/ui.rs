@@ -13,6 +13,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 
+mod bus;
 mod chrome;
 mod menu;
 
@@ -408,6 +409,8 @@ pub struct App {
     help_t: f32,
     /// The usage overview: every account's limits, across hosts.
     pub usage_open: bool,
+    /// The BUS view: jotbus-local traffic between agents (ui/bus.rs).
+    pub bus: bus::BusView,
     /// The resume menu, while open: a host's recent Claude sessions.
     pub resume: Option<ResumeMenu>,
     resume_tx: Sender<(usize, Result<Vec<crate::resume::Recent>, String>)>,
@@ -581,6 +584,7 @@ impl App {
             joined: Default::default(),
             help_t: 0.0,
             usage_open: false,
+            bus: Default::default(),
             resume: None,
             resume_tx,
             resume_rx,
@@ -3353,7 +3357,7 @@ impl App {
 
     /// Apply terminal events. Returns true if anything needs redrawing.
     pub fn pump(&mut self) -> bool {
-        let mut dirty = false;
+        let mut dirty = self.bus_pump();
         if self.size_due.is_some() {
             self.report_tmux_size();
         }

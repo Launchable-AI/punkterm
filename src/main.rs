@@ -1,6 +1,7 @@
 mod anim;
 mod claude;
 mod clipboard;
+mod comms;
 mod gfx;
 mod glyphs;
 mod resume;
@@ -375,6 +376,21 @@ impl ApplicationHandler for Win {
                     gpu.window.request_redraw();
                     return;
                 }
+                if app.bus.open {
+                    match code {
+                        Some(KeyCode::Escape | KeyCode::KeyJ | KeyCode::Enter | KeyCode::KeyQ) => app.toggle_bus(),
+                        Some(KeyCode::Tab) => app.bus_next_host(),
+                        Some(KeyCode::ArrowUp) => app.bus_scroll(1.0),
+                        Some(KeyCode::ArrowDown) => app.bus_scroll(-1.0),
+                        Some(KeyCode::PageUp) => app.bus_scroll(15.0),
+                        Some(KeyCode::PageDown) => app.bus_scroll(-15.0),
+                        Some(KeyCode::End) => app.bus_scroll(-1e6),
+                        Some(KeyCode::Home) => app.bus_scroll(1e6),
+                        _ => {}
+                    }
+                    gpu.window.request_redraw();
+                    return;
+                }
                 if app.overview && !(m.control_key() && m.shift_key() && code != Some(KeyCode::KeyD)) {
                     match code {
                         Some(KeyCode::Escape) | Some(KeyCode::KeyD) if code == Some(KeyCode::Escape) || (m.control_key() && m.shift_key()) => {
@@ -560,6 +576,10 @@ impl ApplicationHandler for Win {
                         }
                         Some(KeyCode::KeyU) => {
                             app.toggle_usage();
+                            true
+                        }
+                        Some(KeyCode::KeyJ) => {
+                            app.toggle_bus();
                             true
                         }
                         Some(KeyCode::KeyF) => {
@@ -751,6 +771,9 @@ impl ApplicationHandler for Win {
                 } else if app.resume.is_some() {
                     app.resume_click(mx, my);
                     gpu.window.request_redraw();
+                } else if app.bus.open {
+                    app.bus_click(mx, my);
+                    gpu.window.request_redraw();
                 } else if !app.help && !app.overview && !app.usage_open && (app.rail_edge_press(mx, my) || app.tasks_edge_press(mx, my)) {
                     gpu.window.request_redraw();
                 } else if app.usage_open {
@@ -821,7 +844,11 @@ impl ApplicationHandler for Win {
                     MouseScrollDelta::LineDelta(_, y) => y * 3.0,
                     MouseScrollDelta::PixelDelta(PhysicalPosition { y, .. }) => y as f32 / app.glyphs.cell_h,
                 };
-                if app.resume.is_some() {
+                if app.bus.open {
+                    if app.bus_at(self.mouse.0 as f32, self.mouse.1 as f32) {
+                        app.bus_scroll(lines);
+                    }
+                } else if app.resume.is_some() {
                     app.resume_step(if lines > 0.0 { -1 } else { 1 });
                 } else if app.rail_list_at(self.mouse.0 as f32, self.mouse.1 as f32) {
                     app.scroll_rail(lines);
@@ -934,6 +961,13 @@ fn snapshot(theme: Theme, args: &Args, path: &str) {
         Some("usage") => {
             app.toggle_usage();
             step(&mut app, 2500);
+        }
+        // "bus", or "bus:N": the BUS view, scrolled N wheel steps up.
+        Some(s) if s == "bus" || s.starts_with("bus:") => {
+            app.toggle_bus();
+            step(&mut app, 3500);
+            app.bus_scroll(s.strip_prefix("bus:").and_then(|n| n.parse().ok()).unwrap_or(0.0));
+            step(&mut app, 300);
         }
         // "cdrag:N:G": session N's card held over group G's header.
         Some(s) if s.starts_with("cdrag:") => {

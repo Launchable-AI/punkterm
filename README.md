@@ -121,10 +121,10 @@ Remote hosts need tmux; the Claude features also need `python3`.
 | Ctrl+= / Ctrl+- | Text size |
 | Ctrl+Space, then v s hjkl z | tmux-style splits and pane moves |
 | Ctrl+click a card | Join that session beside this one (tmux `join-pane`) |
-| Shift+click cards, Ctrl+Space g | Group sessions; click a group's header to roll it up |
+| Shift+click cards, Ctrl+Space g | Group sessions; click a group's header to roll it up, drag it to reorder |
 | REFLOW (Claude session header) | Quit and resume that Claude, reprinting a squashed transcript at the current width |
 | Ctrl+Shift+W twice | Close the session: ends it in tmux, cc-rail rail included ([docs/splits.md](docs/splits.md#closing-a-pane)) |
-| Right-click a card or group header | Menu: join, split, fork Claude, reflow, group, detach, close… |
+| Right-click a card or group header | Menu: join, split, fork Claude, reflow, colour mark, group, detach, close… |
 
 ## Themes
 

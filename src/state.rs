@@ -26,6 +26,8 @@ pub struct Prefs {
     /// The rail's width, as dragged (logical px).
     pub rail_width: Option<f32>,
     pub groups: Vec<GroupPref>,
+    /// Sessions marked with a colour: host name, tab, tmux pane → colour.
+    pub marks: std::collections::BTreeMap<String, String>,
 }
 
 /// A session group as saved.
@@ -76,6 +78,10 @@ pub fn load() -> Prefs {
                 Some(GroupPref { name, collapsed: flag("collapsed"), brief: flag("brief"), members })
             })
             .collect(),
+        marks: get("marks")
+            .and_then(|v| v.as_table().cloned())
+            .map(|t| t.into_iter().filter_map(|(k, v)| Some((k, v.as_str()?.to_string()))).collect())
+            .unwrap_or_default(),
     }
 }
 
@@ -132,6 +138,9 @@ pub fn save(p: &Prefs) {
             toml::Value::Table(g)
         });
         t.insert("groups".into(), toml::Value::Array(groups.collect()));
+    }
+    if !p.marks.is_empty() {
+        t.insert("marks".into(), toml::Value::Table(p.marks.iter().map(|(k, v)| (k.clone(), v.clone().into())).collect()));
     }
     let _ = std::fs::write(path, toml::to_string(&t).unwrap_or_default());
 }

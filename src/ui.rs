@@ -153,6 +153,17 @@ pub struct CardDrag {
     pub moving: bool,
 }
 
+/// A group's header held down: a drag (to reorder the groups) once it
+/// moves a few pixels, else a click (roll it up) when let go.
+pub struct HeadDrag {
+    pub group: usize,
+    /// The host whose heading the header was under.
+    pub host: usize,
+    pub from: (f32, f32),
+    pub at: (f32, f32),
+    pub moving: bool,
+}
+
 /// A split's divider being dragged: the pane before it (left or above)
 /// takes the pointer's distance from its own edge as its new size.
 pub struct DividerDrag {
@@ -390,8 +401,11 @@ pub struct App {
     /// The pane marked to join elsewhere (tmux's `select-pane -m`), by id.
     marked: Option<u64>,
     pub groups: Vec<Group>,
+    /// Sessions marked with a colour (one of `MARKS`), by `member_key`.
+    pub marks: std::collections::BTreeMap<String, String>,
     /// A card being dragged to another group.
     pub card_drag: Option<CardDrag>,
+    pub head_drag: Option<HeadDrag>,
     /// Inline images' places on the GPU.
     pub image_atlas: crate::graphics::Atlas,
     /// A split divider being dragged, and whether the pointer is over one
@@ -574,11 +588,13 @@ impl App {
             leader: None,
             marked: None,
             groups: Vec::new(),
+            marks: Default::default(),
             menu: None,
             divider: None,
             divider_hover: None,
             image_atlas: Default::default(),
             card_drag: None,
+            head_drag: None,
             picked: Default::default(),
             digits: None,
             joined: Default::default(),
@@ -1410,6 +1426,30 @@ impl App {
         true
     }
 
+    /// Session `i`'s colour mark, if it has one.
+    pub fn mark_of(&self, i: usize) -> Option<&str> {
+        (i < self.panes.len()).then(|| self.marks.get(&self.member_key(i)).map(String::as_str)).flatten()
+    }
+
+    /// Mark session `i` with a colour (`None`: clear it); or, when it is one
+    /// of several picked sessions, all of them.
+    pub fn set_mark(&mut self, i: usize, mark: Option<&str>) {
+        let Some(id) = self.panes.get(i).map(|p| p.id) else { return };
+        let targets: Vec<usize> = if self.picked.len() > 1 && self.picked.contains(&id) {
+            (0..self.panes.len()).filter(|&j| self.picked.contains(&self.panes[j].id)).collect()
+        } else {
+            vec![i]
+        };
+        for j in targets {
+            let key = self.member_key(j);
+            match mark {
+                Some(m) => self.marks.insert(key, m.to_string()),
+                None => self.marks.remove(&key),
+            };
+        }
+        self.save_prefs();
+    }
+
     /// Show a group's cards in full, or one line each.
     pub fn toggle_brief(&mut self, g: usize) {
         if let Some(gr) = self.groups.get_mut(g) {
@@ -1418,14 +1458,65 @@ impl App {
         }
     }
 
-    /// A click on a group header: its FULL / BRIEF switch, or roll it up.
+    /// A press on a group header: its FULL / BRIEF switch, or hold the
+    /// header (let go in place: roll it up; drag: move the group).
     pub fn head_click(&mut self, x: f32, y: f32) -> bool {
-        let Some(&(g, _, r)) = self.layout().heads.iter().find(|(_, _, r)| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) else { return false };
+        let Some(&(g, h, r)) = self.layout().heads.iter().find(|(_, _, r)| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) else { return false };
         let b = self.brief_switch(r);
         if !self.groups[g].collapsed && x >= b.x && x <= b.x + b.w {
             self.toggle_brief(g);
         } else {
-            self.toggle_group(g);
+            self.head_drag = Some(HeadDrag { group: g, host: h, from: (x, y), at: (x, y), moving: false });
+        }
+        true
+    }
+
+    /// The pointer moved with a group header held. True while it is dragged.
+    pub fn head_drag_to(&mut self, x: f32, y: f32) -> bool {
+        let Some(d) = self.head_drag.as_mut() else { return false };
+        d.at = (x, y);
+        d.moving |= (y - d.from.1).abs() > 6.0 || (x - d.from.0).abs() > 12.0;
+        d.moving
+    }
+
+    /// Where a dragged group header would go at height `y`, among the
+    /// headers on its host: `(slot, line_y)`, the slot being the group it
+    /// would go before (`None`: after the last), and where to draw the line.
+    pub fn head_slot(&self, y: f32) -> Option<(Option<usize>, f32)> {
+        let d = self.head_drag.as_ref()?;
+        let l = self.layout();
+        let heads: Vec<(usize, Rect)> = l.heads.iter().filter(|h| h.1 == d.host).map(|h| (h.0, h.2)).collect();
+        if let Some(&(g, r)) = heads.iter().find(|(_, r)| y < r.y + r.h / 2.0) {
+            return Some((Some(g), r.y - self.px(3.0)));
+        }
+        // After the last group: below its last card shown (or its header).
+        let &(last, r) = heads.last()?;
+        let bottom = (0..self.panes.len())
+            .filter(|&i| self.panes[i].host == d.host && self.group_of(i) == Some(last) && l.cards[i].w > 0.0)
+            .map(|i| l.cards[i].y + l.cards[i].h)
+            .fold(r.y + r.h, f32::max);
+        Some((None, bottom + self.px(3.0)))
+    }
+
+    /// The group header was let go: roll the group up if it never moved,
+    /// else move it to the slot under the pointer. True if it was held.
+    pub fn head_drop(&mut self, _x: f32, y: f32) -> bool {
+        let Some(slot) = self.head_drag.as_ref().filter(|d| d.moving).map(|_| self.head_slot(y)) else {
+            return match self.head_drag.take() {
+                Some(d) => {
+                    self.toggle_group(d.group);
+                    true
+                }
+                None => false,
+            };
+        };
+        let d = self.head_drag.take().expect("held");
+        if let Some((before, _)) = slot {
+            if move_before(&mut self.groups, d.group, before) {
+                self.regroup();
+                self.save_prefs();
+                self.sound.play(Sfx::Blip);
+            }
         }
         true
     }
@@ -2085,6 +2176,7 @@ impl App {
         self.rail_w = p.rail_width.unwrap_or(RAIL_W).clamp(RAIL_MIN, RAIL_MAX);
         self.load_collapsed = p.load_collapsed.unwrap_or(false);
         self.groups = p.groups.iter().map(|g| Group { name: g.name.clone(), collapsed: g.collapsed, brief: g.brief, members: g.members.clone() }).collect();
+        self.marks = p.marks.iter().filter(|(_, c)| MARKS.contains(&c.as_str())).map(|(k, c)| (k.clone(), c.clone())).collect();
         if !theme_flag {
             if let Some(name) = &p.theme {
                 let t = Theme::load(Some(name));
@@ -2112,6 +2204,7 @@ impl App {
             rail_width: Some(self.rail_w),
             load_collapsed: Some(self.load_collapsed),
             groups: self.groups.iter().map(|g| state::GroupPref { name: g.name.clone(), collapsed: g.collapsed, brief: g.brief, members: g.members.clone() }).collect(),
+            marks: self.marks.clone(),
         });
     }
 
@@ -2685,6 +2778,9 @@ impl App {
 
     /// End pane `i` for good (see `end_active`); no confirmation.
     pub fn end_pane(&mut self, i: usize) {
+        if i < self.panes.len() && self.marks.remove(&self.member_key(i)).is_some() {
+            self.save_prefs();
+        }
         let Some(p) = self.panes.get(i) else { return };
         let (Some(conn), Some(tp)) = (p.conn, p.tmux_pane.clone()) else {
             p.term.lock().exit();
@@ -3726,6 +3822,22 @@ impl App {
         }
     }
 
+    /// A session mark's colour (`MARKS`): the same in every theme (some
+    /// themes' own palettes are one hue), mid-tones that read on light and
+    /// dark alike.
+    pub(super) fn mark_color(&self, name: &str) -> Option<Rgba> {
+        let hex = match name {
+            "red" => "#e5484d",
+            "orange" => "#f2780c",
+            "yellow" => "#e0b000",
+            "green" => "#2fa36b",
+            "blue" => "#3d7ff0",
+            "purple" => "#9450d0",
+            _ => return None,
+        };
+        crate::theme::hex(hex)
+    }
+
     fn status_color(&self, s: Status) -> Rgba {
         let t = &self.theme;
         match s {
@@ -4216,6 +4328,21 @@ fn squash(s: &str) -> String {
 /// The narrowest a pane beside a cc-rail rail may be left.
 const MIN_COLS: usize = 20;
 
+/// Move `v[from]` to just before `v[before]` (`None`: to the end). False
+/// when that leaves the order as it was.
+/// The colours a session can be marked with, as saved (`mark_color`).
+pub const MARKS: [&str; 6] = ["red", "orange", "yellow", "green", "blue", "purple"];
+
+fn move_before<T>(v: &mut Vec<T>, from: usize, before: Option<usize>) -> bool {
+    let to = before.unwrap_or(v.len());
+    if from >= v.len() || to > v.len() || to == from || to == from + 1 {
+        return false;
+    }
+    let item = v.remove(from);
+    v.insert(if to > from { to - 1 } else { to }, item);
+    true
+}
+
 fn clean_title(t: &str) -> String {
     t.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '~' && c != '/' && c != '.').trim().to_string()
 }
@@ -4242,6 +4369,21 @@ fn ago(t: Instant) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moves_groups() {
+        let mv = |from, before| {
+            let mut v = vec!['a', 'b', 'c', 'd'];
+            let moved = move_before(&mut v, from, before);
+            (moved, v.into_iter().collect::<String>())
+        };
+        assert_eq!(mv(0, Some(2)), (true, "bacd".into()));
+        assert_eq!(mv(3, Some(0)), (true, "dabc".into()));
+        assert_eq!(mv(1, None), (true, "acdb".into()));
+        assert_eq!(mv(1, Some(1)), (false, "abcd".into()));
+        assert_eq!(mv(1, Some(2)), (false, "abcd".into()), "already just before c");
+        assert_eq!(mv(3, None), (false, "abcd".into()));
+    }
 
     #[test]
     fn graphics_titles() {

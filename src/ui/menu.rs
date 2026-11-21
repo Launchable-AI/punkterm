@@ -23,6 +23,8 @@ pub enum Act {
     Disband(usize),
     Detach,
     End,
+    /// The row of colour swatches: which one is `Menu::swatch`.
+    Mark,
     HostNew(usize),
     HostResume(usize),
     HostConnect(usize),
@@ -43,6 +45,8 @@ pub struct Menu {
     pub items: Vec<Item>,
     pub at: (f32, f32),
     pub hover: Option<usize>,
+    /// On the colour row: the swatch lit, `MARKS.len()` being "none".
+    pub swatch: usize,
 }
 
 impl Menu {
@@ -52,6 +56,13 @@ impl Menu {
 
     pub fn width(scale: f32) -> f32 {
         (236.0 * scale).round()
+    }
+
+    /// Swatch `s` on the colour row `row` (`MARKS.len()`: the "none" one).
+    pub fn swatch_rect(row: Rect, s: usize, scale: f32) -> Rect {
+        let d = (14.0 * scale).round();
+        let x0 = row.x + (64.0 * scale).round();
+        Rect { x: x0 + s as f32 * (d + (8.0 * scale).round()), y: row.y + ((row.h - d) / 2.0).round(), w: d, h: d }
     }
 
     /// The menu's rect and each row's, kept on screen.
@@ -140,6 +151,19 @@ impl App {
         self.card_drag_to(h.x + 60.0, h.y + h.h / 2.0);
     }
 
+    /// Snapshots: hold group `g`'s header (1-based) and drag it to just
+    /// above group `to`'s header (0: below the last group).
+    pub fn drag_head_over(&mut self, g: usize, to: usize) {
+        let l = self.layout();
+        let Some(from) = l.heads.iter().find(|h| h.0 + 1 == g).map(|h| h.2) else { return };
+        let y = match l.heads.iter().find(|h| h.0 + 1 == to) {
+            Some(h) => h.2.y + 2.0,
+            None => l.rail_view.1 - 4.0,
+        };
+        self.head_click(from.x + 30.0, from.y + from.h / 2.0);
+        self.head_drag_to(from.x + 40.0, y);
+    }
+
     fn host_menu(&self, h: usize) -> Menu {
         use super::HostState;
         let host = &self.hosts[h];
@@ -154,7 +178,7 @@ impl App {
             });
             items.push(item("Remove host", Act::HostRemove(h)));
         }
-        Menu { pane: None, title: host.name.to_uppercase(), items, at: (0.0, 0.0), hover: None }
+        Menu { pane: None, title: host.name.to_uppercase(), items, at: (0.0, 0.0), hover: None, swatch: 0 }
     }
 
     fn group_menu(&self, g: usize) -> Menu {
@@ -164,7 +188,7 @@ impl App {
             item("Rename group…", Act::Rename(g)),
             item("Ungroup all", Act::Disband(g)),
         ];
-        Menu { pane: None, title: gr.name.to_uppercase(), items, at: (0.0, 0.0), hover: None }
+        Menu { pane: None, title: gr.name.to_uppercase(), items, at: (0.0, 0.0), hover: None, swatch: 0 }
     }
 
     fn card_menu(&self, i: usize) -> Menu {
@@ -194,6 +218,7 @@ impl App {
         }
         items.push(item("Upload file…", Act::Upload));
         items.push(divider());
+        items.push(item("Colour", Act::Mark));
         let picked = self.picked.contains(&p.id);
         items.push(item(if picked { "Unpick" } else { "Pick (for a group)" }, Act::Pick));
         let n = self.picked.len();
@@ -212,7 +237,8 @@ impl App {
         items.push(item("Detach (keeps running)", Act::Detach));
         items.push(item(if tmux { "Close (ends it in tmux)" } else { "Close" }, Act::End));
         let title = if p.title.is_empty() { p.subtitle.clone() } else { super::clean_title(&p.title) };
-        Menu { pane: Some(p.id), title, items, at: (0.0, 0.0), hover: None }
+        let swatch = self.mark_of(i).and_then(|m| super::MARKS.iter().position(|&c| c == m)).unwrap_or(super::MARKS.len());
+        Menu { pane: Some(p.id), title, items, at: (0.0, 0.0), hover: None, swatch }
     }
 
     /// The pointer moved: highlight the row under it. True when that changed.
@@ -221,9 +247,26 @@ impl App {
         let Some(m) = self.menu.as_mut() else { return false };
         let (_, rows) = m.rects(scale, screen);
         let h = rows.iter().zip(&m.items).position(|(r, it)| it.act.is_some() && x >= r.x && x <= r.x + r.w && y >= r.y && y < r.y + r.h);
-        let changed = h != m.hover;
+        let mut changed = h != m.hover;
         m.hover = h;
+        if let Some(k) = h.filter(|&k| m.items[k].act == Some(Act::Mark)) {
+            if let Some(s) = (0..=super::MARKS.len()).find(|&s| {
+                let r = Menu::swatch_rect(rows[k], s, scale);
+                x >= r.x - 3.0 && x <= r.x + r.w + 3.0
+            }) {
+                changed |= s != m.swatch;
+                m.swatch = s;
+            }
+        }
         changed
+    }
+
+    /// ←/→ on the colour row: the previous or next swatch.
+    pub fn menu_swatch_step(&mut self, d: isize) {
+        let Some(m) = self.menu.as_mut() else { return };
+        if m.hover.and_then(|h| m.items.get(h)).and_then(|i| i.act) == Some(Act::Mark) {
+            m.swatch = (m.swatch as isize + d).rem_euclid(super::MARKS.len() as isize + 1) as usize;
+        }
     }
 
     /// Up/down through the menu's actions.
@@ -304,6 +347,7 @@ impl App {
                 self.ungroup_picked();
             }
             (Act::End, Some(i)) => self.end_pane(i),
+            (Act::Mark, Some(i)) => self.set_mark(i, super::MARKS.get(m.swatch).copied()),
             (Act::Detach, Some(i)) => {
                 self.select(i);
                 self.close_active();

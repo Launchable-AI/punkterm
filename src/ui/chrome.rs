@@ -645,6 +645,13 @@ impl App {
             if bell > 0.0 {
                 self.shape(q, c, with_alpha(t.accent, 0.22 * bell), None, [cut, 0.0, 0.0, 0.0]);
             }
+            // A colour mark: the card tinted and outlined in it, and a bar at
+            // its right edge (the left one is the selection's).
+            if let Some(mc) = self.mark_of(i).and_then(|m| self.mark_color(m)) {
+                self.shape(q, c, with_alpha(mc, 0.16 * appear), Some(with_alpha(mc, 0.6 * appear)), [cut, 0.0, 0.0, 0.0]);
+                let bw = self.px(3.0);
+                self.rect(q, Rect { x: c.x + c.w - bw, y: c.y + self.px(4.0), w: bw, h: c.h - self.px(8.0) }, with_alpha(mc, appear), 0.0, NO_CLIP);
+            }
             if picked {
                 self.shape(q, c, with_alpha(t.accent2, 0.10), Some(with_alpha(t.accent2, 0.9)), [cut, 0.0, 0.0, 0.0]);
             }
@@ -773,6 +780,26 @@ impl App {
                 let g = Rect { x: mx + self.px(12.0), y: my - self.px(12.0), w, h: self.px(26.0) };
                 self.shape(q, g, with_alpha(t.surface_alt, 0.95), Some(t.accent), [self.px(6.0), 0.0, 0.0, 0.0]);
                 self.label(q, &title, Font::Ui, 12.0, 600, 0.0, g.x + self.px(12.0), g.y + self.px(6.0), t.fg);
+            }
+        }
+
+        // A group header being dragged: a line where the group would go, and
+        // its name under the pointer.
+        if let Some((g, (mx, my))) = self.head_drag.as_ref().filter(|d| d.moving).map(|d| (d.group, d.at)) {
+            if let Some((_, ly)) = self.head_slot(my) {
+                let lx = l.rail.x + self.px(10.0);
+                let lw = l.rail.w - self.px(20.0);
+                let th = self.px(2.0).max(1.0);
+                self.rect(q, Rect { x: lx, y: ly - th / 2.0, w: lw, h: th }, t.accent2, 0.0, NO_CLIP);
+                let d = self.px(7.0);
+                self.shape(q, Rect { x: lx - d / 2.0, y: ly - d / 2.0, w: d, h: d }, t.accent2, None, [d / 2.0, 0.0, d / 2.0, 0.0]);
+            }
+            if let Some(gr) = self.groups.get(g) {
+                let name = self.fit(&gr.name.to_uppercase(), Font::Ui, 10.0, 700, self.px(200.0));
+                let w = self.measure(&name, Font::Ui, 10.0, 700, 2.0) + self.px(24.0);
+                let b = Rect { x: mx + self.px(12.0), y: my - self.px(12.0), w, h: self.px(24.0) };
+                self.shape(q, b, with_alpha(t.surface_alt, 0.95), Some(t.accent2), [self.px(6.0), 0.0, 0.0, 0.0]);
+                self.label(q, &name, Font::Ui, 10.0, 700, 2.0, b.x + self.px(12.0), b.y + self.px(6.0), t.fg);
             }
         }
 
@@ -965,6 +992,8 @@ const KEYS_GROUPS: &[(&str, &str)] = &[
     ("⌃␣ g  ⌃␣ G", "Group picked · ungroup"),
     ("⌃␣ ,", "Rename the group"),
     ("click header", "Roll up: hidden from keys"),
+    ("drag header", "Reorder groups"),
+    ("right-click card", "Colour mark, and more"),
 ];
 
 const LEGEND: &[(Status, &str)] = &[
@@ -2135,6 +2164,9 @@ impl App {
         let (r, rows) = m.rects(self.scale, (self.size.0 as f32, self.size.1 as f32));
         let title = m.title.to_uppercase();
         let items: Vec<(String, bool)> = m.items.iter().map(|i| (i.label.clone(), i.act.is_some())).collect();
+        let mark_row = m.items.iter().position(|i| i.act == Some(super::menu::Act::Mark));
+        let swatch = m.swatch;
+        let current = m.pane.and_then(|id| self.panes.iter().position(|p| p.id == id)).and_then(|i| self.mark_of(i)).map(str::to_string);
         let hover = m.hover;
         let t = self.theme.clone();
         let cut = self.px(8.0);
@@ -2162,6 +2194,35 @@ impl App {
             }
             let label = self.fit(&label, Font::Ui, 12.0, 500, rr.w - self.px(20.0));
             self.label(q, &label, Font::Ui, 12.0, 500, 0.0, rr.x + self.px(10.0), rr.y + self.px(6.0), if on { t.fg } else { mix(t.fg, t.muted, 0.25) });
+            // The colour row: a swatch per colour, then "none"; the one set
+            // ringed, the one under the pointer (or keys) lifted.
+            if mark_row == Some(k) {
+                for s in 0..=super::MARKS.len() {
+                    let b = super::menu::Menu::swatch_rect(*rr, s, self.scale);
+                    let name = super::MARKS.get(s).copied();
+                    let set = current.as_deref() == name;
+                    let lit = on && swatch == s;
+                    let cut = [self.px(4.0), 0.0, self.px(4.0), 0.0];
+                    if lit {
+                        let g = self.px(3.0);
+                        let ring = Rect { x: b.x - g, y: b.y - g, w: b.w + 2.0 * g, h: b.h + 2.0 * g };
+                        self.shape(q, ring, [0.0; 4], Some(t.fg), [self.px(6.0), 0.0, self.px(6.0), 0.0]);
+                    }
+                    match name.and_then(|n| self.mark_color(n)) {
+                        Some(c) => self.shape(q, b, c, None, cut),
+                        // "None": an empty swatch, struck through.
+                        None => {
+                            self.shape(q, b, [0.0; 4], Some(t.muted), cut);
+                            let th = self.px(1.5).max(1.0);
+                            self.rect(q, Rect { x: b.x + self.px(3.0), y: b.y + b.h / 2.0 - th / 2.0, w: b.w - self.px(6.0), h: th }, t.muted, 0.0, NO_CLIP);
+                        }
+                    }
+                    // The colour set now: a bar under it.
+                    if set && name.is_some() {
+                        self.rect(q, Rect { x: b.x, y: b.y + b.h + self.px(3.0), w: b.w, h: self.px(2.0).max(1.0) }, t.fg, 0.0, NO_CLIP);
+                    }
+                }
+            }
         }
     }
 

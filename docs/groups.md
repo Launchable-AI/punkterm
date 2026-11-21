@@ -1,7 +1,7 @@
 # Session groups
 
 Code: `src/ui.rs` (`Group`, `group_picked`, `toggle_group`, `shown`,
-`select_nth`, `regroup`), `src/ui/chrome.rs` (headers in the rail),
+`select_nth`, `regroup`, `head_drop`), `src/ui/chrome.rs` (headers in the rail),
 `src/state.rs` (saved groups).
 
 With many sessions on a host, put the ones you're working on in one group
@@ -14,6 +14,7 @@ and the rest in another, then roll the second up out of the way.
 | Take out of a group | **Ctrl+Space G** (the picked sessions, else the active one) |
 | Rename | **Ctrl+Space ,** renames the active session's group |
 | Roll up / out | Click the group's header |
+| Reorder groups | Drag a group's header up or down: a line shows where it will go |
 | Move a session | Drag its card onto another group's header or cards; onto an ungrouped card to take it out |
 | Full or brief cards | The **FULL / BRIEF** switch on the header |
 | All of the above | Right-click a card or header (see [menu.md](menu.md)) |
@@ -33,6 +34,24 @@ gets. The header's **FULL / BRIEF** switch turns that group's cards to one
 line each, a summary. Ungrouped cards go brief on their own when full ones
 would not fit.
 
+## Order
+
+Groups are listed in the order they were made until you drag one: hold a
+group's header and move it up or down, and a line shows where it will land;
+let go to move it there. A header let go without moving still rolls the
+group up. The order is the same on every host, and session numbers follow
+it. It is saved with the groups.
+
+## Colour marks
+
+Right-click a card and pick a colour on its **Colour** row to mark it: the
+card is tinted and outlined in that colour, with a bar at its right edge.
+Red, orange, yellow, green, blue and purple look the same in every theme;
+the struck-through swatch clears the mark. Shift+click several cards first
+to mark them all at once. A session's mark is saved with the groups (by host
+and tmux pane id, so a tmux server restart can move it to a new session that
+reuses the id) and dropped when you close the session from punkterm.
+
 ## Rolled up
 
 A rolled-up group's sessions are hidden from the rail and skipped by every
@@ -49,7 +68,7 @@ number, where a second digit within a second makes it two-digit
 
 ## Saved
 
-Groups, and whether each is rolled up or brief, are kept in
+Groups, their order, and whether each is rolled up or brief, are kept in
 `~/.local/state/punkterm/state.toml`, each session by its host's name and
 tmux pane id (`%12`), which hold while the tmux server runs, through
 punkterm restarts and joins. After a tmux server restart pane ids are

@@ -302,6 +302,8 @@ impl ApplicationHandler for Win {
                     match code {
                         Some(KeyCode::ArrowDown) => app.menu_step(1),
                         Some(KeyCode::ArrowUp) => app.menu_step(-1),
+                        Some(KeyCode::ArrowLeft) => app.menu_swatch_step(-1),
+                        Some(KeyCode::ArrowRight) => app.menu_swatch_step(1),
                         Some(KeyCode::Enter | KeyCode::NumpadEnter) => app.menu_enter(),
                         Some(KeyCode::ShiftLeft | KeyCode::ShiftRight | KeyCode::ControlLeft | KeyCode::ControlRight) => {}
                         _ => app.menu = None,
@@ -706,6 +708,11 @@ impl ApplicationHandler for Win {
                         None => CursorIcon::Default,
                     });
                 }
+                if app.head_drag_to(position.x as f32, position.y as f32) {
+                    gpu.window.set_cursor(CursorIcon::Grabbing);
+                    gpu.window.request_redraw();
+                    return;
+                }
                 if app.card_drag_to(position.x as f32, position.y as f32) {
                     gpu.window.set_cursor(CursorIcon::Grabbing);
                     gpu.window.request_redraw();
@@ -728,6 +735,10 @@ impl ApplicationHandler for Win {
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 if app.divider_release() | app.rail_edge_release() | app.tasks_edge_release() {
+                    gpu.window.request_redraw();
+                }
+                if app.head_drop(self.mouse.0 as f32, self.mouse.1 as f32) {
+                    gpu.window.set_cursor(CursorIcon::Default);
                     gpu.window.request_redraw();
                 }
                 if app.card_drop(self.mouse.0 as f32, self.mouse.1 as f32) {
@@ -974,6 +985,30 @@ fn snapshot(theme: Theme, args: &Args, path: &str) {
             let v: Vec<usize> = s["cdrag:".len()..].split(':').filter_map(|x| x.parse().ok()).collect();
             if let [n, g] = v[..] {
                 app.drag_card_over(n, g);
+            }
+        }
+        // "mark:N:C": session N marked with colour C (snapshots only; not saved).
+        Some(s) if s.starts_with("mark:") => {
+            for part in s["mark:".len()..].split(',') {
+                if let Some((n, c)) = part.split_once(':') {
+                    if let Ok(n) = n.parse::<usize>() {
+                        app.set_mark(n.saturating_sub(1), Some(c).filter(|c| *c != "none"));
+                    }
+                }
+            }
+            step(&mut app, 400);
+        }
+        // "gdrag:G:T": group G's header dragged to above group T's (0: the
+        // end); "gdrop:G:T" lets go there too.
+        Some(s) if s.starts_with("gdrag:") || s.starts_with("gdrop:") => {
+            let v: Vec<usize> = s[6..].split(':').filter_map(|x| x.parse().ok()).collect();
+            if let [g, to] = v[..] {
+                app.drag_head_over(g, to);
+                if s.starts_with("gdrop:") {
+                    let y = app.head_drag.as_ref().map_or(0.0, |d| d.at.1);
+                    app.head_drop(0.0, y);
+                    step(&mut app, 600);
+                }
             }
         }
         // "divider:DX": drag the first side-by-side divider DX px.

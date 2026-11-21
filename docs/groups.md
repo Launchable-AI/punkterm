@@ -46,7 +46,8 @@ it. It is saved with the groups.
 
 Right-click a card and pick a colour on its **Colour** row to mark it: the
 card is tinted and outlined in that colour, with a bar at its right edge.
-Red, orange, yellow, green, blue and purple look the same in every theme;
+Red, orange, yellow, green, blue, purple and gray look the same in every
+theme; gray also mutes the card's name, for sessions set aside as inactive;
 the struck-through swatch clears the mark. Shift+click several cards first
 to mark them all at once. A session's mark is saved with the groups (by host
 and tmux pane id, so a tmux server restart can move it to a new session that

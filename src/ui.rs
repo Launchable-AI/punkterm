@@ -3833,6 +3833,7 @@ impl App {
             "green" => "#2fa36b",
             "blue" => "#3d7ff0",
             "purple" => "#9450d0",
+            "gray" => "#8a8f98",
             _ => return None,
         };
         crate::theme::hex(hex)
@@ -4331,7 +4332,7 @@ const MIN_COLS: usize = 20;
 /// Move `v[from]` to just before `v[before]` (`None`: to the end). False
 /// when that leaves the order as it was.
 /// The colours a session can be marked with, as saved (`mark_color`).
-pub const MARKS: [&str; 6] = ["red", "orange", "yellow", "green", "blue", "purple"];
+pub const MARKS: [&str; 7] = ["red", "orange", "yellow", "green", "blue", "purple", "gray"];
 
 fn move_before<T>(v: &mut Vec<T>, from: usize, before: Option<usize>) -> bool {
     let to = before.unwrap_or(v.len());

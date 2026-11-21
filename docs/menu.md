@@ -17,7 +17,7 @@ mouse, or ↑ ↓ (← → along the colour swatches) and ↵; any other key or 
 | Fork Claude session… | Switches to it and types `/fork `: Claude Code's fork, which carries the conversation into a new background session, wants a first prompt, so finish it and press ↵ |
 | Reflow (restart and resume) | Quits that Claude and resumes its session in place, reprinted at the pane's width (see [splits.md](splits.md#reflow-fix-a-squashed-session)) |
 | Upload file… | Switches to it and opens a file picker; the files go into that session (see [upload.md](upload.md)) |
-| Colour | Mark the card with a colour: click a swatch (or ← → and ↵); the struck-through one clears it. With several sessions picked, marks them all (see [groups.md](groups.md#colour-marks)) |
+| Colour | Mark the card with a colour (gray: set aside as inactive, its name muted): click a swatch (or ← → and ↵); the struck-through one clears it. With several sessions picked, marks them all (see [groups.md](groups.md#colour-marks)) |
 | Pick / Unpick | For a new group (as Shift+click) |
 | New group… | From the picked sessions, or just this one; asks for a name |
 | Move to *group* | Into that group |

@@ -679,7 +679,9 @@ impl App {
             *animating |= decoding;
 
             let emphasis = active || unseen || matches!(status, Status::Blocked | Status::YourTurn);
-            let fg = with_alpha(if emphasis { t.fg } else { mix(t.fg, t.muted, 0.35) }, appear);
+            // Marked gray: set aside, so its name is muted too (unless open).
+            let grayed = !active && self.mark_of(i) == Some("gray");
+            let fg = with_alpha(if grayed { mix(t.fg, t.muted, 0.7) } else if emphasis { t.fg } else { mix(t.fg, t.muted, 0.35) }, appear);
             let num = format!("{:02}", self.ordinal(i));
             let ncol = if active { t.accent } else { with_alpha(t.muted, 0.8) };
             let compact = c.h < self.px(40.0);

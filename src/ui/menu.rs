@@ -61,8 +61,8 @@ impl Menu {
     /// Swatch `s` on the colour row `row` (`MARKS.len()`: the "none" one).
     pub fn swatch_rect(row: Rect, s: usize, scale: f32) -> Rect {
         let d = (14.0 * scale).round();
-        let x0 = row.x + (64.0 * scale).round();
-        Rect { x: x0 + s as f32 * (d + (8.0 * scale).round()), y: row.y + ((row.h - d) / 2.0).round(), w: d, h: d }
+        let x0 = row.x + (62.0 * scale).round();
+        Rect { x: x0 + s as f32 * (d + (6.0 * scale).round()), y: row.y + ((row.h - d) / 2.0).round(), w: d, h: d }
     }
 
     /// The menu's rect and each row's, kept on screen.
